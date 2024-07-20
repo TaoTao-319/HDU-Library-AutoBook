@@ -26,7 +26,7 @@
 ## 视频教学
 
 <video controls>
-  <source src="docs/tutorial.mov" type="video/quicktime">
+  <source src="docs/tutorial.mp4" type="video/mp4">
   Your browser does not support the video tag.
 </video>
 
