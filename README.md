@@ -1,3 +1,14 @@
+---
+Title: Video title
+URL: YouTube.com/
+Description: One sentence
+Product: e.x. Projects
+Versions: e.x. fpt, GHES > 3.2
+Date added: YYYY-MM-DD
+Location: /where/in/docs
+Transcript: ./content/video-transcripts/filename
+---
+
 ![logo](./docs/logo.png)
 # HDU Auto Book 杭州电子科技大学图书馆自动预约脚本
 
@@ -25,10 +36,7 @@
 
 ## 视频教学
 
-<video controls>
-  <source src="docs/tutorial.mp4" type="video/mp4">
-  Your browser does not support the video tag.
-</video>
+https://github.com/HaleyCH/HDU_AUTO_BOOK-public/blob/V2/docs/tutorial.mp4
 
 ## 配置
  1. fork本仓库
