@@ -23,6 +23,13 @@
 - [设置预约时间](#设置预约时间设置预约时间)
 - [启用脚本](#启用脚本)
 
+## 视频教学
+
+<video controls>
+  <source src="docs/tutorial.mov" type="video/quicktime">
+  Your browser does not support the video tag.
+</video>
+
 ## 配置
  1. fork本仓库
  2. 点击仓库中的 `setting` 标签， 选中 `Secrets` 选项卡
