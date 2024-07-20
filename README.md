@@ -36,7 +36,7 @@ Transcript: ./content/video-transcripts/filename
 
 ## 视频教学
 
-https://github.com/HaleyCH/HDU_AUTO_BOOK-public/blob/V2/docs/tutorial.mp4
+[https://github.com/HaleyCH/HDU_AUTO_BOOK-public/blob/V2/docs/tutorial.mp4](https://github.com/user-attachments/assets/03444438-6150-4b71-8f39-7d5f4eda3992)
 
 ## 配置
  1. fork本仓库
