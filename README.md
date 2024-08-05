@@ -1,14 +1,3 @@
----
-Title: Video title
-URL: YouTube.com/
-Description: One sentence
-Product: e.x. Projects
-Versions: e.x. fpt, GHES > 3.2
-Date added: YYYY-MM-DD
-Location: /where/in/docs
-Transcript: ./content/video-transcripts/filename
----
-
 ![logo](./docs/logo.png)
 # HDU Auto Book 杭州电子科技大学图书馆自动预约脚本
 
