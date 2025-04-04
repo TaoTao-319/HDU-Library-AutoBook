@@ -17,6 +17,10 @@
   begin: 58841
   end: 58899
   type: 自习室
+十二楼:
+  begin: 60212
+  end: 60656
+  type: 自习室
 守正书院:
   begin: 42710
   end: 42842
