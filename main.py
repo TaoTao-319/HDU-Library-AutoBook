@@ -10,6 +10,8 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from urllib.parse import urlsplit
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.wait import WebDriverWait
 import time
@@ -18,18 +20,36 @@ import time
 logging.basicConfig(
                     format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
                     datefmt='%H:%M:%S',
-                    level=logging.DEBUG)
+                    level=logging.INFO)
 
-time_zone = 8  # 时区
+WEEKDAYS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
+BOOK_DAYS_AHEAD = 2  # 预约后天
+ALREADY_BOOKED_KEYS = ("已有预约", "重复预约", "请先取消", "当前已有", "只能预约一个", "已存在预约")
+SEAT_TAKEN_KEYS = ("已被", "占用", "不可用", "不存在", "冲突")
 
-# 两天后日期
+
+def target_weekday_name():
+    return WEEKDAYS[(datetime.now().weekday() + BOOK_DAYS_AHEAD) % 7]
+
+
+def is_booking_enable(date_cfg):
+    if date_cfg['启用']:
+        return True
+    return False
+
+
+def expand_seat_cfg(cfg):
+    ids = []
+    for begin, end in cfg['ranges']:
+        ids.extend(range(begin, end + 1))
+    return ids
+
 
 def get_seats_with_config(user_config, date_config, seat_config):
-    # 二楼东/二楼西/四楼/三楼大厅/守正书院/求新书院/自定义
     seat_name = date_config['name']
     if seat_name == "自定义":
         return user_config['自定义']
-    return list(range(seat_config[seat_name]['begin'], seat_config[seat_name]['end']))
+    return expand_seat_cfg(seat_config[seat_name])
 
 
 class SeatAutoBooker:
@@ -50,34 +70,39 @@ class SeatAutoBooker:
             print("没有Server酱的key,将不会推送消息")
 
         chrome_options = Options()
-        chrome_options.add_argument('--headless')
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
-        self.driver = webdriver.Chrome(service=Service('/usr/local/bin/chromedriver'), options=chrome_options)
+        chrome_options.add_argument('--window-size=1920,1080')
+        chromedriver_path = os.environ.get("CHROMEDRIVER_PATH", "")
+        if not chromedriver_path:
+            for candidate in ('/usr/local/bin/chromedriver', '/opt/homebrew/bin/chromedriver'):
+                if os.path.exists(candidate):
+                    chromedriver_path = candidate
+                    break
+        service = Service(chromedriver_path) if chromedriver_path else Service()
+        self.driver = webdriver.Chrome(service=service, options=chrome_options)
         self.wait = WebDriverWait(self.driver, 10, 0.5)
         self.cookie = None
 
         self.cfg = booker_config
 
     def book_favorite_seat(self, user_config, seat_config):
-        #判断是否到了预约时间
-        # 阅览室晚上9点开始预约，自习室晚上8点半开始预约
-        the_day_after_tomorrow = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'][(datetime.now().weekday() + 2) % 7]
-        seat_type = seat_config[user_config[the_day_after_tomorrow]['name']]["type"]
-        if seat_type == "自习室":
-            start_time = datetime.now().replace(hour=20-time_zone, minute=0, second=0, microsecond=0)
-            end_time = datetime.now().replace(hour=20-time_zone, minute=15, second=0, microsecond=0)
-        else:
-            start_time = datetime.now().replace(hour=21-time_zone, minute=0, second=0, microsecond=0)
-            end_time = datetime.now().replace(hour=21-time_zone, minute=15, second=0, microsecond=0)
-        start_time = start_time - timedelta(minutes=self.cfg["cron-delta-minutes"])
-        if datetime.now() < start_time or datetime.now() > end_time:
-            return -1, "未到预约时间"
-        logging.info('Booking favorite seat')
         retry_sleep_time = timedelta(minutes=self.cfg["cron-delta-minutes"]).seconds*2/(self.cfg["max-retry"]-2) - 10
         for tried_times in range(self.cfg["max-retry"]):
             try:
-                return self._book_favorite_seat(user_config, seat_config, tried_times)
+                result = self._book_favorite_seat(user_config, seat_config, tried_times)
+                msg = str(result[1]) if result else ""
+                if result and any(k in msg for k in ALREADY_BOOKED_KEYS):
+                    print("已有预约，结束：{}".format(result[1]))
+                    return result
+                if result and any(k in msg for k in ("频繁", "人数过多")):
+                    print("触发限流({})，{:.0f}秒后重试".format(result[1], retry_sleep_time))
+                    time.sleep(retry_sleep_time)
+                    continue
+                if result and any(k in msg for k in SEAT_TAKEN_KEYS):
+                    print("座位不可约({})，换一个再试".format(result[1]))
+                    continue
+                return result
             except Exception as e:
                 logging.exception(e)
                 print(e.__class__, "尝试第{}次".format(tried_times))
@@ -85,11 +110,10 @@ class SeatAutoBooker:
 
     def _book_favorite_seat(self, user_config, seat_config, tried_times=0):
         logging.info('Entering _book_favorite_seat method')
-        the_day_after_tomorrow = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'][(datetime.now().weekday() + 2) % 7]
-        date_config = user_config[the_day_after_tomorrow]
+        date_config = user_config[target_weekday_name()]
         seats = get_seats_with_config(user_config, date_config, seat_config)
         today_0_clock = datetime.strptime(datetime.now().strftime("%Y-%m-%d 00:00:00"), "%Y-%m-%d %H:%M:%S")
-        book_time = today_0_clock + timedelta(days=2) + timedelta(hours=date_config['开始时间'])
+        book_time = today_0_clock + timedelta(days=BOOK_DAYS_AHEAD) + timedelta(hours=date_config['开始时间'])
         delta = book_time - self.cfg["start-time"]
         total_seconds = delta.days * 24 * 3600 + delta.seconds
         if date_config['name'] == '自定义' and tried_times<self.cfg["max-retry"]/3*2:
@@ -108,33 +132,46 @@ class SeatAutoBooker:
     def login(self):
         logging.info('Login in')
 
-        pwd_path_selector = """//*[@id="react-root"]/div/div/div[1]/div[2]/div/div[1]/div[2]/div/div/div/div/div[1]/div[2]/div/div[3]/div/div[2]/input"""
-        button_path_selector = """//*[@id="react-root"]/div/div/div[1]/div[2]/div/div[1]/div[2]/div/div/div/div/div[1]/div[3]"""
-
         try:
             logging.info('开始登陆...')
 
             self.driver.get("https://hdu.huitu.zhishulib.com/")
-            logging.debug('打开网站.')
+            self.wait.until(lambda d: "sso.hdu.edu.cn" in d.current_url)
 
-            self.wait.until(EC.presence_of_element_located((By.NAME, "login_name")))
-            logging.debug('找到用户名输入框.')
+            # 排除同名隐藏域
+            form_wait = WebDriverWait(self.driver, 30, 0.5)
+            user_el = form_wait.until(EC.element_to_be_clickable(
+                (By.CSS_SELECTOR, "input[name='username']:not([type='hidden'])")
+            ))
 
-            self.wait.until(EC.presence_of_element_located((By.XPATH, pwd_path_selector)))
-            logging.debug('找到密码输入框.')
+            # 关掉公告弹窗
+            for close_button in self.driver.find_elements(
+                By.CSS_SELECTOR, "img.icon-close, .ant-modal-close"
+            ):
+                if close_button.is_displayed() and close_button.is_enabled():
+                    close_button.click()
+                    self.wait.until(EC.invisibility_of_element(close_button))
 
-            self.wait.until(EC.presence_of_element_located((By.XPATH, button_path_selector)))
-            logging.debug('找到登录按钮.')
-
-            self.driver.find_element(By.NAME, 'login_name').clear()
-            self.driver.find_element(By.NAME, 'login_name').send_keys(self.un)  # 传送帐号
+            user_el.clear()
+            user_el.send_keys(self.un)
             logging.info('输入用户名')
 
-            self.driver.find_element(By.XPATH, pwd_path_selector).clear()
-            self.driver.find_element(By.XPATH, pwd_path_selector).send_keys(self.pd)  # 输入密码
+            pwd_el = form_wait.until(EC.visibility_of_element_located(
+                (By.CSS_SELECTOR, "input[type='password']")))
+            pwd_el.clear()
+            pwd_el.send_keys(self.pd)
             logging.info('输入密码')
+
+            # 失焦后再点登录
+            pwd_el.send_keys(Keys.TAB)
+            form_wait.until(lambda d: "disabled" not in d.find_element(
+                By.CSS_SELECTOR, "button.login-button").get_attribute("class"))
+            self.driver.find_element(By.CSS_SELECTOR, "button.login-button").click()
             logging.info('点击登录按钮')
-            self.driver.find_element(By.XPATH, button_path_selector).click()
+
+            # 等跳回图书馆域名
+            WebDriverWait(self.driver, 30, 0.5).until(
+                lambda d: urlsplit(d.current_url).hostname == "hdu.huitu.zhishulib.com")
             time.sleep(5)
             cookie_list = self.driver.get_cookies()
             self.cookie = ";".join([item["name"] + "=" + item["value"] + "" for item in cookie_list])
@@ -183,11 +220,6 @@ class SeatAutoBooker:
                 logging.exception(e)
                 print(e.__class__, "推送服务配置错误")
 
-def is_booking_enable(date_cfg):
-    if date_cfg['启用']:
-        return True
-    return False
-
 if __name__ == "__main__":
     logging.info('Start of the program')
     with open("user_config.yml", 'r') as f_obj:
@@ -197,8 +229,7 @@ if __name__ == "__main__":
     with open("config/seat_config.yml", 'r') as f_obj:
         seat_config = yaml.safe_load(f_obj)
 
-    the_day_after_tomorrow = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'][(datetime.now().weekday() + 2) % 7]
-    if not is_booking_enable(user_config[the_day_after_tomorrow]):
+    if not is_booking_enable(user_config[target_weekday_name()]):
         logging.info('预约未启用')
         print("预约未启用")
         exit(0)
@@ -212,6 +243,8 @@ if __name__ == "__main__":
         s.driver.quit()
         logging.info('Getting user info unsuccessful')
         exit(-1)
-    s.book_favorite_seat(user_config=user_config, seat_config=seat_config)
+    result = s.book_favorite_seat(user_config=user_config, seat_config=seat_config)
+    code, message = result if result else (-1, "预约失败")
+    print("预约结果: {} {}".format(code, message))
     s.driver.quit()
     logging.info('End of the program')
