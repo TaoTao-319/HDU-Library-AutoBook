@@ -12,7 +12,7 @@
 
 电脑需要保持开机，并保持保存凭据的 Windows 用户已登录；锁屏可以。休眠唤醒取决于 Windows 电源策略。脚本目录移动后需要重新安装任务。遇到人工验证码时退出并明确提示。
 
-GitHub Actions 也已改为 UTC `0,2 12 * * *`，对应北京时间 20:00 / 20:02；GitHub 调度存在排队延迟，需要低延迟时使用本机任务。GitHub Actions 需要在仓库 Settings → Secrets and variables → Actions 中设置 SCHOOL_ID 和 PASSWORD。
+GitHub Actions 配置了两条每日定时：UTC `0 12 * * *` 和 `2 12 * * *`，对应北京时间 20:00 / 20:02；GitHub 调度存在排队延迟，需要低延迟时使用本机任务。GitHub Actions 需要在仓库 Settings → Secrets and variables → Actions 中设置 SCHOOL_ID 和 PASSWORD。
 
 ## 本机运行
 

@@ -4,7 +4,8 @@ on:
   workflow_dispatch:
   schedule:
     # UTC -> 北京时间 20:00 / 20:02。GitHub cron 可能排队延迟。
-    - cron: '0,2 12 * * *'
+    - cron: '0 12 * * *'
+    - cron: '2 12 * * *'
 
 concurrency:
   group: hdu-seat-booking
