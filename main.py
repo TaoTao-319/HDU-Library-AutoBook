@@ -1,299 +1,494 @@
+"""HDU seat booking. All scheduling and booking dates use Asia/Shanghai."""
+import argparse
+import base64
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
+import logging
+import math
+import os
+from pathlib import Path
+import random
+import subprocess
+import sys
+import time
+from urllib.parse import urlsplit, parse_qsl
+
 import requests
 import yaml
-import random
-from datetime import datetime, timedelta
-import json
-import os
-import logging
-
 from selenium import webdriver
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
-from urllib.parse import urlsplit
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.wait import WebDriverWait
-import time
+from selenium.webdriver.support.ui import WebDriverWait
 
-
-logging.basicConfig(
-                    format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
-                    datefmt='%H:%M:%S',
-                    level=logging.INFO)
-
+ROOT = Path(__file__).resolve().parent
+LOCAL = ROOT / '.local'
+SHANGHAI = timezone(timedelta(hours=8), 'Asia/Shanghai')
+BASE_URL = 'https://hdu.huitu.zhishulib.com'
+BOOK_PATH = '/Seat/Index/bookSeats?LAB_JSON=1'
 WEEKDAYS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
-BOOK_DAYS_AHEAD = 2  # 预约后天
-ALREADY_BOOKED_KEYS = ("已有预约", "重复预约", "请先取消", "当前已有", "只能预约一个", "已存在预约")
-SEAT_TAKEN_KEYS = ("已被", "占用", "不可用", "不存在", "冲突")
+ACTIVE_STATUSES = {'0', '1', '2', '8'}
+LOG = logging.getLogger('hdu')
 
 
-def target_weekday_name():
-    return WEEKDAYS[(datetime.now().weekday() + BOOK_DAYS_AHEAD) % 7]
+class BookingError(RuntimeError):
+    pass
 
 
-def is_booking_enable(date_cfg):
-    if date_cfg['启用']:
-        return True
-    return False
+def now():
+    return datetime.now(SHANGHAI)
 
 
-def expand_seat_cfg(cfg):
-    ids = []
-    for begin, end in cfg['ranges']:
-        ids.extend(range(begin, end + 1))
-    return ids
+def read_yaml(path):
+    with Path(path).open(encoding='utf-8-sig') as stream:
+        return yaml.safe_load(stream)
 
 
-def get_seats_with_config(user_config, date_config, seat_config):
-    seat_name = date_config['name']
-    if seat_name == "自定义":
-        return user_config['自定义']
-    return expand_seat_cfg(seat_config[seat_name])
-
-
-def slot_label(start, hours):
-    return "{:g}:00-{:g}:00".format(start, start + hours)
-
-
-# 一天要么配 开始时间/持续小时数 一个时段，要么配「时间段」列表约多段
-def get_time_slots(date_config):
-    if '时间段' in date_config:
-        if '开始时间' in date_config or '持续小时数' in date_config:
-            raise ValueError("「时间段」与「开始时间/持续小时数」不能同时配置，请只保留一种")
-        if not date_config['时间段']:
-            raise ValueError("「时间段」为空，请至少填一个时段")
-        slots = [(item['开始时间'], item['持续小时数']) for item in date_config['时间段']]
+def get_time_slots(config):
+    if '时间段' in config:
+        if '开始时间' in config or '持续小时数' in config:
+            raise ValueError('时间段与开始时间/持续小时数不能同时配置')
+        if not config['时间段']:
+            raise ValueError('时间段不能为空')
+        slots = [(x['开始时间'], x['持续小时数']) for x in config['时间段']]
     else:
-        slots = [(date_config['开始时间'], date_config['持续小时数'])]
-    for _, hours in slots:
-        if hours <= 0:
-            raise ValueError("持续小时数必须大于 0")
+        slots = [(config['开始时间'], config['持续小时数'])]
+    for start, hours in slots:
+        if any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x)
+               for x in (start, hours)):
+            raise ValueError('开始时间和持续小时数必须是有限数字')
+        if start < 0 or hours <= 0 or start + hours > 24:
+            raise ValueError('时段必须位于同一天内且持续时间大于零')
+        if start * 3600 % 1 or hours * 3600 % 1:
+            raise ValueError('时间精度最多到秒')
     slots = sorted(slots)
-    for (prev_start, prev_hours), (next_start, _) in zip(slots, slots[1:]):
-        if next_start < prev_start + prev_hours:
-            raise ValueError("时间段重合：{} 与 {}:00 起".format(
-                slot_label(prev_start, prev_hours), next_start))
+    for (start, hours), (following, _) in zip(slots, slots[1:]):
+        if following < start + hours:
+            raise ValueError('时间段不能重合')
     return slots
 
 
-class SeatAutoBooker:
-    def __init__(self, booker_config):
-        self.json = None
-        self.resp = None
-        self.user_data = None
+def booking_token(data):
+    # Match the official web client's ordered MD5 hex -> base64 signature.
+    order = ['api_time', 'beginTime', 'duration', 'is_recommend', 'seatBookers[0]', 'seats[0]']
+    canonical = 'post&' + BOOK_PATH + '&' + '&'.join(k + str(data[k]) for k in order)
+    return base64.b64encode(hashlib.md5(canonical.encode()).hexdigest().encode()).decode()
 
-        logging.info('Creating SeatAutoBooker object')
 
-        self.un = os.environ["SCHOOL_ID"].strip()  # 学号
-        print("使用用户：{}".format(self.un))
-        self.pd = os.environ["PASSWORD"].strip()  # 密码
-        self.SCKey = None
-        try:
-            self.SCKey = os.environ["SCKEY"]
-        except KeyError:
-            print("没有Server酱的key,将不会推送消息")
+def credentials():
+    username, password = os.environ.get('SCHOOL_ID'), os.environ.get('PASSWORD')
+    if username and password:
+        return username.strip(), password
+    path = LOCAL / 'credentials.xml'
+    if os.name == 'nt' and path.exists():
+        command = ("[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "
+                   "$c=Import-Clixml -LiteralPath $env:HDU_CREDENTIAL_FILE; "
+                   "@{SCHOOL_ID=$c.UserName;PASSWORD=$c.GetNetworkCredential().Password} | ConvertTo-Json -Compress")
+        result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', command],
+                                env=dict(os.environ, HDU_CREDENTIAL_FILE=str(path)),
+                                capture_output=True, timeout=15, check=False)
+        if result.returncode == 0:
+            value = json.loads(result.stdout.decode('utf-8-sig'))
+            return value['SCHOOL_ID'], value['PASSWORD']
+        raise BookingError('无法解密本机凭据，请重新运行 Save-Credential.ps1')
+    raise BookingError('请设置 SCHOOL_ID、PASSWORD 环境变量或运行 Save-Credential.ps1')
 
-        chrome_options = Options()
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--window-size=1920,1080')
-        chromedriver_path = os.environ.get("CHROMEDRIVER_PATH", "")
-        if not chromedriver_path:
-            for candidate in ('/usr/local/bin/chromedriver', '/opt/homebrew/bin/chromedriver'):
-                if os.path.exists(candidate):
-                    chromedriver_path = candidate
-                    break
-        service = Service(chromedriver_path) if chromedriver_path else Service()
-        self.driver = webdriver.Chrome(service=service, options=chrome_options)
-        self.wait = WebDriverWait(self.driver, 10, 0.5)
-        self.cookie = None
 
-        self.cfg = booker_config
+def walk(value):
+    if isinstance(value, dict):
+        yield value
+        for item in value.values():
+            yield from walk(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from walk(item)
 
-    def book_favorite_seat(self, user_config, seat_config):
-        results = []
-        preferred_seat = None
-        for start, hours in get_time_slots(user_config[target_weekday_name()]):
-            label = slot_label(start, hours)
-            print("开始预约时段 {}".format(label))
-            result = self._book_slot(user_config, seat_config, start, hours, preferred_seat)
-            if result:
-                code, message, seat = result
-                preferred_seat = seat
-                results.append((label, code, message))
-            else:
-                results.append((label, -1, "预约失败"))
-        return results
 
-    def _book_slot(self, user_config, seat_config, start, hours, preferred_seat=None):
-        retry_sleep_time = timedelta(minutes=self.cfg["cron-delta-minutes"]).seconds*2/(self.cfg["max-retry"]-2) - 10
-        for tried_times in range(self.cfg["max-retry"]):
-            try:
-                result = self._book_favorite_seat(user_config, seat_config, start, hours, tried_times, preferred_seat)
-                msg = str(result[1]) if result else ""
-                if result and any(k in msg for k in ALREADY_BOOKED_KEYS):
-                    print("该时段已有预约，跳过：{}".format(result[1]))
-                    return result
-                if result and any(k in msg for k in ("频繁", "人数过多")):
-                    print("触发限流({})，{:.0f}秒后重试".format(result[1], retry_sleep_time))
-                    time.sleep(retry_sleep_time)
-                    continue
-                if result and any(k in msg for k in SEAT_TAKEN_KEYS):
-                    print("座位不可约({})，换一个再试".format(result[1]))
-                    continue
-                return result
-            except Exception as e:
-                logging.exception(e)
-                print(e.__class__, "尝试第{}次".format(tried_times))
-                time.sleep(retry_sleep_time)
+def configured_seats(region, seat_config, custom):
+    if region == '自定义':
+        ids = list(dict.fromkeys(int(x) for x in custom))
+    else:
+        names = [region] if region != '不限' else [
+            name for name, cfg in seat_config.items() if cfg.get('type') == '自习室' and 'ranges' in cfg]
+        ids = list(dict.fromkeys(seat for name in names
+                   for start, end in seat_config[name]['ranges'] for seat in range(start, end + 1)))
+        random.shuffle(ids)
+    if not ids:
+        raise BookingError('配置内没有候选座位')
+    return [{'id': seat, 'number': str(seat), 'room': region} for seat in ids]
 
-    def _book_favorite_seat(self, user_config, seat_config, start, hours, tried_times=0, preferred_seat=None):
-        logging.info('Entering _book_favorite_seat method')
-        date_config = user_config[target_weekday_name()]
-        seats = get_seats_with_config(user_config, date_config, seat_config)
-        today_0_clock = datetime.strptime(datetime.now().strftime("%Y-%m-%d 00:00:00"), "%Y-%m-%d %H:%M:%S")
-        book_time = today_0_clock + timedelta(days=BOOK_DAYS_AHEAD) + timedelta(hours=start)
-        delta = book_time - self.cfg["start-time"]
-        total_seconds = delta.days * 24 * 3600 + delta.seconds
-        # 第一轮优先沿用上一时段约到的座位，被占后再随机换
-        if tried_times == 0 and preferred_seat in seats:
-            seat = preferred_seat
-        elif date_config['name'] == '自定义' and tried_times<self.cfg["max-retry"]/3*2:
-            seat = seats[0]
+
+def wait_until(target, wall=time.time, monotonic=time.perf_counter, sleep=time.sleep):
+    deadline = monotonic() + target.timestamp() - wall()
+    while True:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return
+        sleep(min(remaining / 2, 0.01) if remaining < 0.1 else min(remaining - 0.05, 1.0))
+
+
+@contextmanager
+def single_instance():
+    LOCAL.mkdir(exist_ok=True)
+    lock = (LOCAL / 'run.lock').open('a+b')
+    lock.seek(0)
+    if lock.read(1) == b'':
+        lock.write(b'0')
+        lock.flush()
+    lock.seek(0)
+    try:
+        if os.name == 'nt':
+            import msvcrt
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
         else:
-            seat = random.choice(seats)
-        data = f"beginTime={total_seconds}&duration={3600 * hours}&&seats[0]={seat}&seatBookers[0]={self.user_data['uid']}"
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.close()
+        raise BookingError('已有预约进程在运行，本次退出') from None
+    try:
+        yield
+    finally:
+        lock.close()
 
-        headers = self.cfg["headers"]
-        headers['Cookie'] = self.cookie
-        print(data)
-        self.resp = requests.post(self.cfg["target"], data=data, headers=headers)
-        self.json = json.loads(self.resp.text)
-        return self.json["CODE"], self.json["MESSAGE"] + " 座位:{}".format(seat), seat
+
+class SeatAutoBooker:
+    def __init__(self, config):
+        self.config = config
+        self.session = requests.Session()
+        self.session.headers.update({
+            'Accept': 'application/json, text/plain, */*',
+            'User-Agent': 'Mozilla/5.0 Chrome/130.0.0.0 Safari/537.36',
+            'Origin': BASE_URL, 'Referer': BASE_URL + '/Space/Category/list',
+        })
+        self.uid = None
+        self.categories = {}
+
+    def close(self):
+        self.session.close()
+
+    def request(self, method, path, **kwargs):
+        if not path.startswith('/') or path.startswith('//'):
+            raise BookingError('API 路径无效')
+        started = time.perf_counter()
+        response = self.session.request(method, BASE_URL + path, timeout=(5, 15), **kwargs)
+        elapsed = (time.perf_counter() - started) * 1000
+        response.raise_for_status()
+        if urlsplit(response.url).hostname != urlsplit(BASE_URL).hostname:
+            raise BookingError('会话失效，API 已跳转到登录页')
+        try:
+            payload = response.json()
+        except ValueError:
+            raise BookingError('API 未返回 JSON，可能是会话失效或服务异常') from None
+        if not isinstance(payload, dict):
+            raise BookingError('API 响应结构不正确')
+        LOG.info('%s %s 耗时 %.1f ms', method, path.split('?')[0], elapsed)
+        return payload
 
     def login(self):
-        logging.info('Login in')
-
+        username, password = credentials()
+        options = Options()
+        if os.environ.get('HDU_SHOW_BROWSER') != '1':
+            options.add_argument('--headless=new')
+        options.add_argument('--window-size=1440,1000')
+        options.add_argument('--disable-dev-shm-usage')
+        if os.name != 'nt':
+            options.add_argument('--no-sandbox')
+        if os.environ.get('CHROME_BINARY'):
+            options.binary_location = os.environ['CHROME_BINARY']
+        driver_path = os.environ.get('CHROMEDRIVER_PATH')
+        driver = webdriver.Chrome(options=options, service=Service(driver_path) if driver_path else Service())
+        driver.set_page_load_timeout(45)
         try:
-            logging.info('开始登陆...')
+            LOG.info('开始学校统一身份认证')
+            driver.get(BASE_URL + '/')
+            wait = WebDriverWait(driver, 60, 0.1)
+            user = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR,
+                            "input[name='username']:not([type='hidden'])")))
+            for button in driver.find_elements(By.CSS_SELECTOR, 'img.icon-close, .ant-modal-close'):
+                if button.is_displayed() and button.is_enabled():
+                    button.click()
+            user.clear()
+            user.send_keys(username)
+            pwd = driver.find_element(By.CSS_SELECTOR, 'input[type=password]')
+            pwd.clear()
+            pwd.send_keys(password)
+            pwd.send_keys(Keys.TAB)
+            wait.until(lambda d: 'disabled' not in d.find_element(
+                By.CSS_SELECTOR, 'button.login-button').get_attribute('class'))
+            driver.find_element(By.CSS_SELECTOR, 'button.login-button').click()
 
-            self.driver.get("https://hdu.huitu.zhishulib.com/")
-            self.wait.until(lambda d: "sso.hdu.edu.cn" in d.current_url)
+            def authenticated(d):
+                if urlsplit(d.current_url).hostname == urlsplit(BASE_URL).hostname:
+                    return True
+                for message in d.find_elements(By.CSS_SELECTOR, '.ant-message-error, .error-message, .ant-alert-error'):
+                    if message.is_displayed() and message.text:
+                        raise BookingError('统一身份认证失败：' + message.text[:150])
+                return False
 
-            # 排除同名隐藏域
-            form_wait = WebDriverWait(self.driver, 30, 0.5)
-            user_el = form_wait.until(EC.element_to_be_clickable(
-                (By.CSS_SELECTOR, "input[name='username']:not([type='hidden'])")
-            ))
-
-            # 关掉公告弹窗
-            for close_button in self.driver.find_elements(
-                By.CSS_SELECTOR, "img.icon-close, .ant-modal-close"
-            ):
-                if close_button.is_displayed() and close_button.is_enabled():
-                    close_button.click()
-                    self.wait.until(EC.invisibility_of_element(close_button))
-
-            user_el.clear()
-            user_el.send_keys(self.un)
-            logging.info('输入用户名')
-
-            pwd_el = form_wait.until(EC.visibility_of_element_located(
-                (By.CSS_SELECTOR, "input[type='password']")))
-            pwd_el.clear()
-            pwd_el.send_keys(self.pd)
-            logging.info('输入密码')
-
-            # 失焦后再点登录
-            pwd_el.send_keys(Keys.TAB)
-            form_wait.until(lambda d: "disabled" not in d.find_element(
-                By.CSS_SELECTOR, "button.login-button").get_attribute("class"))
-            self.driver.find_element(By.CSS_SELECTOR, "button.login-button").click()
-            logging.info('点击登录按钮')
-
-            # 等跳回图书馆域名
-            WebDriverWait(self.driver, 30, 0.5).until(
-                lambda d: urlsplit(d.current_url).hostname == "hdu.huitu.zhishulib.com")
-            time.sleep(5)
-            cookie_list = self.driver.get_cookies()
-            self.cookie = ";".join([item["name"] + "=" + item["value"] + "" for item in cookie_list])
-            self.cfg["headers"]['Cookie'] = self.cookie
-
-            logging.info("登录成功！")
-        except Exception as e:
-            logging.error(f"登录失败：{e}")
-            return -1
-        return 0
+            wait.until(authenticated)
+            for cookie in driver.get_cookies():
+                self.session.cookies.set(cookie['name'], cookie['value'],
+                                         domain=cookie['domain'], path=cookie['path'])
+        except TimeoutException:
+            raise BookingError('登录等待超时；检查网络、密码或人工验证要求（HDU_SHOW_BROWSER=1 可查看）') from None
+        finally:
+            driver.quit()
+        self.get_user_info()
+        self.load_categories()
+        LOG.info('登录验证成功，已复用 HTTP 会话')
 
     def get_user_info(self):
-        logging.info('Getting user info')
+        payload = self.request('GET', '/Seat/Index/index?LAB_JSON=1')
+        data = payload.get('DATA', {})
+        if payload.get('CODE') != 'ok' or not data.get('is_login') or not data.get('uid'):
+            raise BookingError('登录状态验证失败')
+        self.uid = int(data['uid'])
 
-        headers = self.cfg["headers"]
-        headers['Cookie'] = self.cookie
-        try:
-            resp = requests.get("https://hdu.huitu.zhishulib.com/Seat/Index/searchSeats?LAB_JSON=1",
-                                headers=headers)
-            self.user_data = resp.json()['DATA']
-            _ = self.user_data['uid']
-        except Exception as e:
-            logging.exception(e)
-            print(self.user_data)
-            print(e.__class__.__name__ + ",获取用户数据失败")
-            return -1
-        print("获取用户数据成功")
-        return 0
+    def load_categories(self):
+        payload = self.request('GET', '/Space/Category/list?LAB_JSON=1')
+        self.categories = {item['name']: item['link']['url'] for item in walk(payload)
+                           if item.get('ui_type') == 'ht.space.SpaceReservationListItem'
+                           and not item.get('disabled') and item.get('link', {}).get('url')}
+        if not self.categories:
+            raise BookingError('未找到可预约区域分类')
 
-    def wechatNotice(self, message, desp=None):
-        logging.info('Sending WeChat notice')
+    def bookings(self):
+        items, seen = [], set()
+        path = '/Seat/Index/myBookingList?LAB_JSON=1'
+        for _ in range(30):
+            if path in seen:
+                raise BookingError('预约记录分页循环')
+            seen.add(path)
+            payload = self.request('GET', path)
+            for item in walk(payload):
+                if item.get('ui_type') == 'ht.Seat.OrderListItem':
+                    items.append(item)
+            path = payload.get('content', {}).get('defaultNextUrl')
+            if not path:
+                return items
+        raise BookingError('预约记录超过分页上限，无法可靠确认重复预约')
 
-        if self.SCKey != '':
-            url = 'https://sctapi.ftqq.com/{0}.send'.format(self.SCKey)
-            data = {
-                'title': message,
-                desp: desp,
-            }
+    @staticmethod
+    def covered_booking(items, begin, duration):
+        for item in items:
+            if str(item.get('status')) not in ACTIVE_STATUSES:
+                continue
+            existing = int(item['time'])
+            end = existing + int(item['duration'])
+            if existing <= begin and end >= begin + duration:
+                return item
+            if existing < begin + duration and end > begin:
+                raise BookingError('与已有预约部分重叠，请先调整配置或预约')
+        return None
+
+    def available_seats(self, region, begin, duration, seat_config, custom):
+        if region == '自定义':
+            allowed = [int(x) for x in custom]
+            if not allowed:
+                raise BookingError('自定义座位列表为空')
+            category_names, room_id = list(self.categories), None
+        elif region == '不限':
+            allowed, room_id = None, None
+            category_names = [x for x in ('自习室', '阅览室', '生活区') if x in self.categories]
+        else:
+            if region not in seat_config:
+                raise BookingError('未知区域：' + region)
+            cfg = seat_config[region]
+            category_names, room_id, allowed = [cfg['type']], int(cfg['room_id']), None
+        seats = {}
+        for category in category_names:
+            if category not in self.categories:
+                continue
+            category_url = urlsplit(self.categories[category])
+            data = dict(parse_qsl(category_url.query))
+            data.update({'beginTime': begin, 'duration': duration, 'num': 1})
+            payload = self.request('POST', category_url.path + '?LAB_JSON=1', data=data)
+            if payload.get('ui_type') == 'com.Message':
+                raise BookingError(payload.get('MESSAGE', '无法查询座位'))
+            if payload.get('IsImgCode'):
+                raise BookingError('该区域需要人工验证码，无法无人值守预约')
+            for item in walk(payload):
+                seat_map = item.get('seatMap', {})
+                if not isinstance(seat_map, dict):
+                    continue
+                info = seat_map.get('info', {})
+                if not info or (room_id and int(info['id']) != room_id):
+                    continue
+                for poi in seat_map.get('POIs', []):
+                    seat_id = int(poi['id'])
+                    free = str(poi.get('state')) == '0' or (str(poi.get('state')) == '2' and poi.get('recommend'))
+                    if free and (allowed is None or seat_id in allowed):
+                        seats[seat_id] = {'id': seat_id, 'number': poi['title'], 'room': info['title']}
+            if seats and region == '不限':
+                break
+        if allowed:
+            return [seats[x] for x in allowed if x in seats]
+        result = list(seats.values())
+        random.shuffle(result)
+        return result
+
+    def verify(self, booking_id, begin=None, duration=None, seat_id=None):
+        payload = self.request('GET', f'/Seat/Index/bookingInfo?bookingId={int(booking_id)}&LAB_JSON=1')
+        booking = payload.get('data', {}).get('booking', {})
+        if (str(booking.get('id')) != str(booking_id)
+                or str(booking.get('status')) not in ACTIVE_STATUSES
+                or int(booking.get('user', {}).get('id', 0)) != self.uid):
+            raise BookingError('订单详情验证失败')
+        if begin is not None and int(booking['begin_time']) != begin:
+            raise BookingError('订单开始时间不符')
+        if duration is not None and int(booking['duration']) != duration:
+            raise BookingError('订单持续时间不符')
+        if seat_id is not None and int(booking.get('seat', {}).get('id', 0)) != seat_id:
+            raise BookingError('订单座位不符')
+        return {'booking_id': str(booking_id), 'room': booking['space']['title'],
+                'seat': booking['seat']['title'], 'seat_id': booking['seat']['id'],
+                'begin': datetime.fromtimestamp(int(booking['begin_time']), SHANGHAI).isoformat(),
+                'duration': int(booking['duration']), 'status': str(booking['status'])}
+
+    def book_slot(self, begin, duration, seats):
+        attempts = min(int(self.config.get('max-retry', 5)), len(seats))
+        if attempts <= 0:
+            raise BookingError('没有符合条件的空闲座位')
+        for seat in seats[:attempts]:
+            data = {'api_time': int(time.time()), 'beginTime': begin, 'duration': duration,
+                    'is_recommend': 0, 'seatBookers[0]': self.uid, 'seats[0]': seat['id']}
             try:
-                r = requests.post(url, data=data)
-                if r.json()["data"]["error"] == 'SUCCESS':
-                    print("Server酱通知成功")
-                else:
-                    print("Server酱通知失败")
-            except Exception as e:
-                logging.exception(e)
-                print(e.__class__, "推送服务配置错误")
+                payload = self.request('POST', BOOK_PATH, data=data, headers={'Api-Token': booking_token(data)})
+            except requests.RequestException:
+                existing = self.covered_booking(self.bookings(), begin, duration)
+                if existing:
+                    return self.verify(existing['id'])
+                raise BookingError('预约网络异常，查单未发现订单；停止提交，等待下一轮补跑') from None
+            result = payload.get('DATA', {})
+            if payload.get('CODE') == 'ok' and result.get('result') == 'success' and result.get('bookingId'):
+                return self.verify(result['bookingId'], begin, duration, seat['id'])
+            message = str(result.get('msg') or payload.get('MESSAGE') or '预约失败')
+            if any(key in message for key in ('已有预约', '重复预约', '已存在预约', '请先取消')):
+                existing = self.covered_booking(self.bookings(), begin, duration)
+                if existing:
+                    return self.verify(existing['id'])
+                raise BookingError('已有其他预约，请核对预约记录：' + message)
+            if any(key in message for key in ('已被', '占用', '不可用', '不存在', '冲突', '已预约')):
+                LOG.warning('座位 %s 不可约：%s', seat['number'], message)
+                time.sleep(0.3)
+                continue
+            if any(key in message for key in ('频繁', '人数过多', '稍后')):
+                raise BookingError('服务限流，等待下一轮补跑：' + message)
+            raise BookingError('预约被拒绝：' + message)
+        raise BookingError('候选座位均已不可用，等待下一轮补跑')
 
-if __name__ == "__main__":
-    logging.info('Start of the program')
-    with open("user_config.yml", 'r') as f_obj:
-        user_config = yaml.safe_load(f_obj)
-    with open("config/basic_config.yml", 'r') as f_obj:
-        basic_config = yaml.safe_load(f_obj)
-    with open("config/seat_config.yml", 'r') as f_obj:
-        seat_config = yaml.safe_load(f_obj)
 
-    if not is_booking_enable(user_config[target_weekday_name()]):
-        logging.info('预约未启用')
-        print("预约未启用")
-        exit(0)
+def parse_args():
+    parser = argparse.ArgumentParser(description='杭电图书馆预约，时区固定为北京时间')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--check', action='store_true', help='只验证登录和座位，不提交')
+    mode.add_argument('--test-booking', action='store_true', help='忽略星期开关，真实预约一个测试时段')
+    parser.add_argument('--date', type=lambda s: datetime.strptime(s, '%Y-%m-%d').date())
+    parser.add_argument('--start', type=float, default=7)
+    parser.add_argument('--hours', type=float, default=1)
+    parser.add_argument('--region', default='二楼西')
+    parser.add_argument('--at', choices=['21:15', '21:20'], help='提前登录，等到今天的目标时刻提交')
+    return parser.parse_args()
 
+
+def run(args):
+    user_config = read_yaml(ROOT / 'user_config.yml')
+    basic = read_yaml(ROOT / 'config/basic_config.yml')['SeatAutoBooker']
+    seat_config = read_yaml(ROOT / 'config/seat_config.yml')
+    target_date = args.date or (now() + timedelta(days=2)).date()
+    target_time = None
+    if args.check or args.test_booking:
+        day = {'name': args.region, '开始时间': args.start, '持续小时数': args.hours}
+    else:
+        weekday = WEEKDAYS[target_date.weekday()]
+        day = user_config[weekday]
+        if day.get('启用') is not True:
+            LOG.info('%s %s 预约未启用；请在 user_config.yml 设置日常规则', target_date, weekday)
+            return 0
+    if args.at:
+        hour, minute = map(int, args.at.split(':'))
+        target_time = now().replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if now() > target_time + timedelta(seconds=30):
+            raise BookingError('定时目标已过期超过 30 秒，本轮退出')
+    slots = get_time_slots(day)
+    client = SeatAutoBooker(basic)
     try:
-        get_time_slots(user_config[target_weekday_name()])
-    except (ValueError, KeyError, TypeError) as e:
-        print("user_config.yml 中「{}」的时段配置有误：{}".format(target_weekday_name(), e))
-        exit(-1)
+        client.login()
+        existing = client.bookings()
+        prepared = []
+        midnight = datetime.combine(target_date, datetime.min.time(), SHANGHAI)
+        for start, hours in slots:
+            begin = int((midnight + timedelta(hours=start)).timestamp())
+            duration = int(hours * 3600)
+            duplicate = client.covered_booking(existing, begin, duration)
+            if duplicate:
+                LOG.info('时段已有预约，核验订单 %s', duplicate['id'])
+                prepared.append((begin, duration, [], client.verify(duplicate['id'])))
+                continue
+            try:
+                seats = client.available_seats(day['name'], begin, duration, seat_config, user_config.get('自定义', []))
+            except BookingError as error:
+                # Some release windows reject tomorrow+1 even one minute before opening.
+                if not (target_time and now() < target_time and any(
+                        word in str(error) for word in ('未开放', '未到', '提前', '日期', '时间范围'))):
+                    raise
+                seats = configured_seats(day['name'], seat_config, user_config.get('自定义', []))
+                LOG.info('预约窗口尚未开放，已准备配置内候选座位，将在目标时刻提交')
+            LOG.info('%s %g:00 起 %g 小时，%s 可用座位 %d 个', target_date, start, hours, day['name'], len(seats))
+            prepared.append((begin, duration, seats, None))
+        if args.check:
+            LOG.info('只读检查完成，未提交预约')
+            return 0
+        if target_time and any(duplicate is None for _, _, _, duplicate in prepared):
+            if now() > target_time + timedelta(seconds=30):
+                raise BookingError('准备完成时已超过目标时间 30 秒，本轮退出')
+            LOG.info('登录、查单及选座已完成；等待 %s', target_time.isoformat())
+            wait_until(target_time - timedelta(seconds=2))
+            client.get_user_info()  # Refresh the TCP/TLS connection immediately before submission.
+            if now() > target_time + timedelta(seconds=30):
+                raise BookingError('连接预热超时，本轮退出')
+            wait_until(target_time)
+            LOG.info('触发偏差 %.3f ms', (now() - target_time).total_seconds() * 1000)
+        results = []
+        for begin, duration, seats, duplicate in prepared:
+            result = duplicate or client.book_slot(begin, duration, seats)
+            result['already_existed'] = duplicate is not None
+            LOG.info('预约已核实：%s %s号座，%s，订单 %s', result['room'], result['seat'], result['begin'], result['booking_id'])
+            results.append(result)
+            LOCAL.mkdir(exist_ok=True)
+            report = LOCAL / ('booking-' + now().strftime('%Y%m%d-%H%M%S-%f') + '.json')
+            report.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8')
+        return 0
+    finally:
+        client.close()
 
-    s = SeatAutoBooker(basic_config["SeatAutoBooker"])
-    if not s.login() == 0:
-        s.driver.quit()
-        logging.info('Login unsuccessful')
-        exit(-1)
-    if not s.get_user_info() == 0:
-        s.driver.quit()
-        logging.info('Getting user info unsuccessful')
-        exit(-1)
-    results = s.book_favorite_seat(user_config=user_config, seat_config=seat_config)
-    for slot, code, message in results:
-        print("预约结果[{}]: {} {}".format(slot, code, message))
-    s.driver.quit()
-    logging.info('End of the program')
+
+def main():
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    (ROOT / 'logs').mkdir(exist_ok=True)
+    logging.Formatter.converter = lambda *args: now().timetuple()
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s.%(msecs)03d %(levelname)s %(message)s',
+                        datefmt='%Y-%m-%d %H:%M:%S', handlers=[logging.StreamHandler(),
+                        logging.FileHandler(ROOT / 'logs' / (now().strftime('%Y-%m-%d') + '.log'), encoding='utf-8')])
+    args = parse_args()
+    try:
+        with single_instance():
+            return run(args)
+    except (BookingError, ValueError, KeyError, requests.RequestException) as error:
+        LOG.error('%s', error)
+        return 1
+    except Exception as error:
+        LOG.error('运行异常：%s（不输出可能包含凭据的浏览器堆栈）', type(error).__name__)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
