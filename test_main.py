@@ -118,17 +118,17 @@ class BookingTests(unittest.TestCase):
         self.assertTrue(all(0 < value <= 1 for value in sleeps))
 
     def test_disabled_day_never_logs_in(self):
-        args = Mock(date=datetime(2026, 10, 21).date(), at='21:15', check=False, test_booking=False)
+        args = Mock(date=datetime(2026, 10, 21).date(), at='20:00', check=False, test_booking=False)
         configs = [{'周三': {'启用': False}}, {'SeatAutoBooker': {}}, {}]
         with patch('main.read_yaml', side_effect=configs), patch('main.SeatAutoBooker') as client:
             self.assertEqual(main.run(args), 0)
             client.assert_not_called()
 
     def test_scheduled_flow_warms_connection_and_submits_at_target(self):
-        target = datetime(2026, 10, 19, 21, 15, tzinfo=main.SHANGHAI)
+        target = datetime(2026, 10, 19, 20, 0, tzinfo=main.SHANGHAI)
         clock = [target - timedelta(seconds=60)]
         events = []
-        args = Mock(date=datetime(2026, 10, 21).date(), at='21:15', check=False, test_booking=False)
+        args = Mock(date=datetime(2026, 10, 21).date(), at='20:00', check=False, test_booking=False)
         configs = [{'周三': {'启用': True, 'name': '二楼西', '开始时间': 7, '持续小时数': 1}},
                    {'SeatAutoBooker': {}}, {}]
         client = Mock()
