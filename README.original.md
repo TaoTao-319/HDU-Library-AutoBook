@@ -1,4 +1,4 @@
-> 本文为原作者 README 原文归档。当前用法见 [`README.md`](./README.md)。
+> 本文为原作者 README 归档（已移除过时的教学视频链接）。当前用法见 [`README.md`](./README.md)。
 
 ![logo](./docs/logo.png)
 # HDU Auto Book 杭州电子科技大学图书馆自动预约脚本
@@ -27,10 +27,6 @@
 - [配置](#配置)
 - [设置预约时间](#设置预约时间设置预约时间)
 - [启用脚本](#启用脚本)
-
-## 视频教学
-
-[https://github.com/HaleyCH/HDU_AUTO_BOOK-public/blob/V2/docs/tutorial.mp4](https://github.com/user-attachments/assets/03444438-6150-4b71-8f39-7d5f4eda3992)
 
 ## 配置
  1. fork本仓库
