@@ -197,6 +197,7 @@ class SeatAutoBooker:
             options.add_argument('--headless=new')
         options.add_argument('--window-size=1440,1000')
         options.add_argument('--disable-dev-shm-usage')
+        options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
         if os.name != 'nt':
             options.add_argument('--no-sandbox')
         if os.environ.get('CHROME_BINARY'):
@@ -204,12 +205,16 @@ class SeatAutoBooker:
         driver_path = os.environ.get('CHROMEDRIVER_PATH')
         driver = webdriver.Chrome(options=options, service=Service(driver_path) if driver_path else Service())
         driver.set_page_load_timeout(45)
+        stage = '打开图书馆页面'
         try:
             LOG.info('开始学校统一身份认证')
             driver.get(BASE_URL + '/')
+            stage = '等待学校登录表单'
+            LOG.info('已打开登录入口，当前域名 %s', urlsplit(driver.current_url).hostname)
             wait = WebDriverWait(driver, 60, 0.1)
             user = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR,
                             "input[name='username']:not([type='hidden'])")))
+            LOG.info('学校登录表单已就绪')
             for button in driver.find_elements(By.CSS_SELECTOR, 'img.icon-close, .ant-modal-close'):
                 if button.is_displayed() and button.is_enabled():
                     button.click()
@@ -219,9 +224,12 @@ class SeatAutoBooker:
             pwd.clear()
             pwd.send_keys(password)
             pwd.send_keys(Keys.TAB)
+            stage = '等待登录按钮启用'
             wait.until(lambda d: 'disabled' not in d.find_element(
                 By.CSS_SELECTOR, 'button.login-button').get_attribute('class'))
             driver.find_element(By.CSS_SELECTOR, 'button.login-button').click()
+            stage = '等待认证完成并返回图书馆'
+            LOG.info('已提交学校登录表单，等待返回图书馆')
 
             def authenticated(d):
                 if urlsplit(d.current_url).hostname == urlsplit(BASE_URL).hostname:
@@ -236,7 +244,24 @@ class SeatAutoBooker:
                 self.session.cookies.set(cookie['name'], cookie['value'],
                                          domain=cookie['domain'], path=cookie['path'])
         except TimeoutException:
-            raise BookingError('登录等待超时；检查网络、密码或人工验证要求（HDU_SHOW_BROWSER=1 可查看）') from None
+            try:
+                location = urlsplit(driver.current_url)
+                text = driver.find_element(By.TAG_NAME, 'body').text[-1800:]
+                for secret in (username, password):
+                    if secret:
+                        text = text.replace(secret, '[已隐藏]')
+                LOG.error('登录超时阶段：%s；页面：%s%s；页面文本：%s',
+                          stage, location.hostname, location.path, text)
+                failures = []
+                for entry in driver.get_log('performance'):
+                    event = json.loads(entry['message'])['message']
+                    if event['method'] == 'Network.loadingFailed':
+                        failures.append(event['params'].get('errorText', 'unknown'))
+                if failures:
+                    LOG.error('浏览器网络错误：%s', failures[-12:])
+            except Exception:
+                LOG.error('登录超时阶段：%s；无法读取进一步诊断', stage)
+            raise BookingError('登录等待超时，阶段：' + stage) from None
         finally:
             driver.quit()
         self.get_user_info()
