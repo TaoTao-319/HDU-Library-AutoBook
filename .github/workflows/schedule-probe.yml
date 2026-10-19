@@ -1,0 +1,32 @@
+name: Temporary schedule diagnostic
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/schedule-probe.yml']
+  schedule:
+    - cron: '*/5 * * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  timestamp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Record trigger without logging in or booking
+        env:
+          TRIGGER_EVENT: ${{ github.event_name }}
+          CRON_EXPRESSION: ${{ github.event.schedule }}
+        run: |
+          python3 - <<'PY'
+          from datetime import datetime, timezone, timedelta
+          import os
+          print('event=' + os.environ['TRIGGER_EVENT'])
+          print('cron=' + os.environ.get('CRON_EXPRESSION', ''))
+          print('utc=' + datetime.now(timezone.utc).isoformat())
+          print('beijing=' + datetime.now(timezone(timedelta(hours=8))).isoformat())
+          print('diagnostic_only=True; no credentials loaded; no reservation requests')
+          PY
