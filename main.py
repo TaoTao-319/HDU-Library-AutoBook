@@ -393,13 +393,17 @@ def parse_args():
     parser.add_argument('--start', type=float, default=7)
     parser.add_argument('--hours', type=float, default=1)
     parser.add_argument('--region', default='二楼西')
-    parser.add_argument('--at', choices=['20:00', '20:02'], help='提前登录，等到今天的目标时刻提交')
+    parser.add_argument('--at', choices=['21:40', '21:45'], help='提前登录，等到今天的目标时刻提交')
     return parser.parse_args()
 
 
 def run(args):
     user_config = read_yaml(ROOT / 'user_config.yml')
     basic = read_yaml(ROOT / 'config/basic_config.yml')['SeatAutoBooker']
+    if basic.get('cloud-only', False) and os.environ.get('GITHUB_ACTIONS') != 'true':
+        LOG.info('本机执行已停用：当前仅允许 GitHub Actions 云端运行，未登录、未提交预约')
+        return 0
+    LOG.info('执行环境：%s', 'GitHub Actions 云端' if os.environ.get('GITHUB_ACTIONS') == 'true' else '本机')
     seat_config = read_yaml(ROOT / 'config/seat_config.yml')
     target_date = args.date or (now() + timedelta(days=2)).date()
     target_time = None

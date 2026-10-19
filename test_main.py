@@ -117,18 +117,35 @@ class BookingTests(unittest.TestCase):
         self.assertGreaterEqual(elapsed[0], 1)
         self.assertTrue(all(0 < value <= 1 for value in sleeps))
 
+    def test_cloud_only_blocks_local_before_login(self):
+        configs = [{}, {'SeatAutoBooker': {'cloud-only': True}}]
+        with patch('main.read_yaml', side_effect=configs), patch('main.os.environ', {}), \
+                patch('main.SeatAutoBooker') as client, self.assertLogs('hdu', level='INFO') as logs:
+            self.assertEqual(main.run(Mock()), 0)
+            client.assert_not_called()
+        self.assertTrue(any('本机执行已停用' in line for line in logs.output))
+
+    def test_cloud_only_allows_actions_to_read_day_configuration(self):
+        args = Mock(date=datetime(2026, 10, 24).date(), at=None, check=False, test_booking=False)
+        configs = [{'周六': {'启用': False}}, {'SeatAutoBooker': {'cloud-only': True}}, {}]
+        with patch('main.read_yaml', side_effect=configs), patch('main.os.environ', {'GITHUB_ACTIONS': 'true'}), \
+                self.assertLogs('hdu', level='INFO') as logs:
+            self.assertEqual(main.run(args), 0)
+        self.assertTrue(any('执行环境：GitHub Actions 云端' in line for line in logs.output))
+        self.assertTrue(any('周六 预约未启用' in line for line in logs.output))
+
     def test_disabled_day_never_logs_in(self):
-        args = Mock(date=datetime(2026, 10, 21).date(), at='20:00', check=False, test_booking=False)
+        args = Mock(date=datetime(2026, 10, 21).date(), at='21:40', check=False, test_booking=False)
         configs = [{'周三': {'启用': False}}, {'SeatAutoBooker': {}}, {}]
         with patch('main.read_yaml', side_effect=configs), patch('main.SeatAutoBooker') as client:
             self.assertEqual(main.run(args), 0)
             client.assert_not_called()
 
     def test_scheduled_flow_warms_connection_and_submits_at_target(self):
-        target = datetime(2026, 10, 19, 20, 0, tzinfo=main.SHANGHAI)
+        target = datetime(2026, 10, 19, 21, 40, tzinfo=main.SHANGHAI)
         clock = [target - timedelta(seconds=60)]
         events = []
-        args = Mock(date=datetime(2026, 10, 21).date(), at='20:00', check=False, test_booking=False)
+        args = Mock(date=datetime(2026, 10, 21).date(), at='21:40', check=False, test_booking=False)
         configs = [{'周三': {'启用': True, 'name': '二楼西', '开始时间': 7, '持续小时数': 1}},
                    {'SeatAutoBooker': {}}, {}]
         client = Mock()

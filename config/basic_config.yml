@@ -1,3 +1,5 @@
 SeatAutoBooker:
+  # 云端测试期间禁止本机登录和预约，只允许 GitHub Actions 执行。
+  cloud-only: true
   # 顺序尝试不同可用座位；遇到服务限流等待下轮补跑。
   max-retry: 5

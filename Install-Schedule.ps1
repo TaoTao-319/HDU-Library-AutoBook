@@ -1,7 +1,7 @@
 param([switch]$Remove)
 $ErrorActionPreference = 'Stop'
-$taskNames = @('HDU-Library-2000', 'HDU-Library-2002')
-$legacyTaskNames = @('HDU-Library-2003', 'HDU-Library-2110', 'HDU-Library-2115', 'HDU-Library-2120')
+$taskNames = @('HDU-Library-2140', 'HDU-Library-2145')
+$legacyTaskNames = @('HDU-Library-2000', 'HDU-Library-2002', 'HDU-Library-2003', 'HDU-Library-2110', 'HDU-Library-2115', 'HDU-Library-2120')
 if ($Remove) {
     foreach ($taskName in ($taskNames + $legacyTaskNames)) {
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
@@ -24,8 +24,8 @@ $principal = New-ScheduledTaskPrincipal -UserId $windowsUser -LogonType Interact
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -WakeToRun -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 2 -Seconds 30)
 $schedule = @(
-    @{Name='HDU-Library-2000'; Prepare='19:59'; Submit='20:00'},
-    @{Name='HDU-Library-2002'; Prepare='20:01'; Submit='20:02'}
+    @{Name='HDU-Library-2140'; Prepare='21:39'; Submit='21:40'},
+    @{Name='HDU-Library-2145'; Prepare='21:44'; Submit='21:45'}
 )
 foreach ($entry in $schedule) {
     $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + `
@@ -35,10 +35,12 @@ foreach ($entry in $schedule) {
     $task = New-ScheduledTask -Action $action -Trigger $trigger -Settings $settings -Principal $principal `
         -Description ('HDU library: pre-login at ' + $entry.Prepare + ', submit at ' + $entry.Submit + ' Asia/Shanghai; skips disabled weekdays.')
     Register-ScheduledTask -TaskName $entry.Name -InputObject $task -Force | Out-Null
+    # Keep local tasks disabled while validating GitHub Actions only.
+    Disable-ScheduledTask -TaskName $entry.Name | Out-Null
 }
 foreach ($taskName in $legacyTaskNames) {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 }
 Get-ScheduledTask -TaskName $taskNames | Select-Object TaskName,State
-Write-Output 'Installed. Submission: 20:00 and 20:02 Beijing time. Keep this PC on and this Windows user signed in.'
+Write-Output 'Local tasks installed DISABLED for cloud-only testing. Configured times: 21:40 and 21:45 Beijing time.'
 Write-Output 'Enable the desired booking weekdays in user_config.yml. Logs are stored in logs/.'
