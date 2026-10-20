@@ -3,9 +3,9 @@ name: HDU Auto Book
 on:
   workflow_dispatch:
   schedule:
-    # UTC -> 北京时间 21:40 / 21:45。GitHub cron 可能排队延迟。
-    - cron: '40 13 * * *'
-    - cron: '45 13 * * *'
+    # UTC -> 北京时间 20:00 / 20:02。GitHub cron 可能排队延迟。
+    - cron: '0 12 * * *'
+    - cron: '2 12 * * *'
 
 concurrency:
   group: hdu-seat-booking

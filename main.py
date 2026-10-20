@@ -421,7 +421,7 @@ def parse_args():
     parser.add_argument('--start', type=float, default=7)
     parser.add_argument('--hours', type=float, default=1)
     parser.add_argument('--region', default='二楼西')
-    parser.add_argument('--at', choices=['21:40', '21:45'], help='提前登录，等到今天的目标时刻提交')
+    parser.add_argument('--at', choices=['20:00', '20:02'], help='提前登录，等到今天的目标时刻提交')
     return parser.parse_args()
 
 

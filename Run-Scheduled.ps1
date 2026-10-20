@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][ValidateSet('21:40','21:45')][string]$At)
+param([Parameter(Mandatory=$true)][ValidateSet('20:00','20:02')][string]$At)
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 $env:PYTHONIOENCODING = 'utf-8'
