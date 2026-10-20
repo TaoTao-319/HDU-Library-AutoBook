@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import requests
 import main
+from scripts.verify_native_booking import verify_native_booking
 
 
 class BookingTests(unittest.TestCase):
@@ -76,7 +77,7 @@ class BookingTests(unittest.TestCase):
         client.verify = Mock(return_value={'booking_id': '9'})
         with patch('main.time.sleep'):
             self.assertEqual(client.book_slot(100, 200, [{'id': 1, 'number': '1'},
-                             {'id': 2, 'number': '2'}]), {'booking_id': '9'})
+                             {'id': 2, 'number': '2'}]), {'booking_id': '9', 'submission_confirmed': True})
         client.verify.assert_called_once_with('9', 100, 200, 2)
 
     def test_timeout_queries_before_any_second_post(self):
@@ -86,6 +87,22 @@ class BookingTests(unittest.TestCase):
         client.verify = Mock(return_value={'booking_id': '9'})
         self.assertEqual(client.book_slot(100, 200, [{'id': 1}]), {'booking_id': '9'})
         self.assertEqual(client.request.call_count, 1)
+
+    def test_native_acceptance_rejects_manual_duplicate_and_uncertain_orders(self):
+        confirmed = {'github_run_id': '77', 'trigger_event': 'schedule',
+                     'submission_confirmed': True, 'already_existed': False, 'seat_id': '62599'}
+        with tempfile.TemporaryDirectory() as folder:
+            report = Path(folder) / 'booking-test.json'
+            report.write_text(json.dumps([confirmed]), encoding='utf-8')
+            self.assertEqual(verify_native_booking(folder, 'schedule', '77'), [confirmed])
+            for event, run_id in [('workflow_dispatch', '77'), ('push', '77'), ('schedule', '78')]:
+                with self.subTest(event=event, run_id=run_id), self.assertRaises(ValueError):
+                    verify_native_booking(folder, event, run_id)
+            for changes in [{'already_existed': True}, {'submission_confirmed': False},
+                            {'seat_id': 62598}, {'seat_id': 62623}, {'trigger_event': 'workflow_dispatch'}]:
+                report.write_text(json.dumps([dict(confirmed, **changes)]), encoding='utf-8')
+                with self.subTest(changes=changes), self.assertRaises(ValueError):
+                    verify_native_booking(folder, 'schedule', '77')
 
     def test_search_uses_form_category_and_ignores_non_map_blocks(self):
         client = self.client()

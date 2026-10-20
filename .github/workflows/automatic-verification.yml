@@ -55,7 +55,9 @@ jobs:
         env:
           SCHOOL_ID: ${{ secrets.SCHOOL_ID }}
           PASSWORD: ${{ secrets.PASSWORD }}
-        run: python main.py
+        run: |
+          python main.py
+          python scripts/verify_native_booking.py
       - name: Disable temporary verification after success or expiry
         if: always() && (steps.window.outputs.active == 'false' || steps.booking.outcome == 'success')
         env:

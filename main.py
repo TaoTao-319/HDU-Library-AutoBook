@@ -392,7 +392,10 @@ class SeatAutoBooker:
                 raise BookingError('预约网络异常，查单未发现订单；停止提交，等待下一轮补跑') from None
             result = payload.get('DATA', {})
             if payload.get('CODE') == 'ok' and result.get('result') == 'success' and result.get('bookingId'):
-                return self.verify(result['bookingId'], begin, duration, seat['id'])
+                verified = self.verify(result['bookingId'], begin, duration, seat['id'])
+                verified['submission_confirmed'] = True
+                LOG.info('新预约提交已获服务器确认并通过查单：订单 %s', result['bookingId'])
+                return verified
             message = str(result.get('msg') or payload.get('MESSAGE') or '预约失败')
             if any(key in message for key in ('已有预约', '重复预约', '已存在预约', '请先取消')):
                 existing = self.covered_booking(self.bookings(), begin, duration)
@@ -491,6 +494,9 @@ def run(args):
         for begin, duration, seats, duplicate in prepared:
             result = duplicate or client.book_slot(begin, duration, seats)
             result['already_existed'] = duplicate is not None
+            result.setdefault('submission_confirmed', False)
+            result['trigger_event'] = os.environ.get('GITHUB_EVENT_NAME', 'local')
+            result['github_run_id'] = os.environ.get('GITHUB_RUN_ID', '')
             LOG.info('预约已核实：%s %s号座，%s，订单 %s', result['room'], result['seat'], result['begin'], result['booking_id'])
             results.append(result)
             LOCAL.mkdir(exist_ok=True)
