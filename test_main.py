@@ -1,6 +1,10 @@
 """Offline regressions: no credentials, browsers, or real bookings."""
 from datetime import datetime, timedelta
 import json
+import logging
+import subprocess
+import sys
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -12,6 +16,25 @@ from scripts.verify_native_booking import verify_native_booking
 
 
 class BookingTests(unittest.TestCase):
+    def test_second_process_skips_locked_booking_and_can_run_after_release(self):
+        code = """import os
+from pathlib import Path
+import main
+main.LOCAL = Path(os.environ['HDU_TEST_LOCK_DIR'])
+try:
+    with main.single_instance():
+        print('acquired')
+except main.AlreadyRunning:
+    print('busy')
+"""
+        with tempfile.TemporaryDirectory() as folder, patch('main.LOCAL', Path(folder)):
+            def check():
+                return subprocess.run([sys.executable, '-c', code], cwd=main.ROOT,
+                    env=dict(os.environ, HDU_TEST_LOCK_DIR=folder),
+                    capture_output=True, text=True, check=True, timeout=15).stdout.strip()
+            with main.single_instance():
+                self.assertEqual(check(), 'busy')
+            self.assertEqual(check(), 'acquired')
     def test_utf8_config_independent_of_system_encoding(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'config.yml'
@@ -35,6 +58,12 @@ class BookingTests(unittest.TestCase):
     def test_timestamp_uses_china_timezone(self):
         value = datetime(2026, 10, 21, 7, tzinfo=main.SHANGHAI)
         self.assertEqual(int(value.timestamp()), 1792537200)
+
+    def test_log_timestamp_uses_record_time_across_second_boundary(self):
+        record = logging.LogRecord('hdu', logging.INFO, '', 0, 'test', (), None)
+        record.created = datetime(2026, 10, 20, 19, 59, 59, tzinfo=main.SHANGHAI).timestamp() + 0.999
+        with patch.object(logging.Formatter, 'converter', staticmethod(main.log_time)):
+            self.assertEqual(logging.Formatter().formatTime(record, '%H:%M:%S'), '19:59:59')
 
     def test_token_matches_javascript_client(self):
         # Independent JS fixture, captured/calculated from the official canonical string.
@@ -130,7 +159,7 @@ class BookingTests(unittest.TestCase):
             sleeps.append(seconds)
             elapsed[0] += max(seconds, 0.00001)
         target = datetime.fromtimestamp(1001, main.SHANGHAI)
-        main.wait_until(target, wall=lambda: 1000, monotonic=lambda: elapsed[0], sleep=sleep)
+        main.wait_until(target, wall=lambda: 1000 + elapsed[0], monotonic=lambda: elapsed[0], sleep=sleep)
         self.assertGreaterEqual(elapsed[0], 1)
         self.assertTrue(all(0 < value <= 1 for value in sleeps))
 
@@ -164,7 +193,7 @@ class BookingTests(unittest.TestCase):
         events = []
         args = Mock(date=datetime(2026, 10, 21).date(), at='20:00', check=False, test_booking=False)
         configs = [{'周三': {'启用': True, 'name': '二楼西', '开始时间': 7, '持续小时数': 1}},
-                   {'SeatAutoBooker': {}}, {}]
+                   {'SeatAutoBooker': {}}, {'二楼西': {'ranges': [[1, 1]]}}]
         client = Mock()
         client.bookings.return_value = []
         client.covered_booking.return_value = None
@@ -172,8 +201,8 @@ class BookingTests(unittest.TestCase):
         def wait(value):
             clock[0] = max(clock[0], value)
             events.append(('wait', value))
-        client.get_user_info.side_effect = lambda: events.append(('warm', clock[0]))
-        def submit(*args):
+        client.get_user_info.side_effect = lambda **kwargs: events.append(('warm', clock[0]))
+        def submit(*args, **kwargs):
             events.append(('submit', clock[0]))
             return {'room': '二楼西', 'seat': '1', 'begin': '2026-10-21T07:00:00+08:00', 'booking_id': '9'}
         client.book_slot.side_effect = submit
@@ -181,9 +210,115 @@ class BookingTests(unittest.TestCase):
                 patch('main.now', side_effect=lambda: clock[0]), patch('main.read_yaml', side_effect=configs), \
                 patch('main.SeatAutoBooker', return_value=client), patch('main.wait_until', side_effect=wait):
             self.assertEqual(main.run(args), 0)
-        self.assertEqual(events, [('wait', target - timedelta(seconds=2)),
-                                 ('warm', target - timedelta(seconds=2)),
+        client.available_seats.assert_not_called()
+        self.assertEqual(events, [('wait', target - timedelta(seconds=10)),
+                                 ('warm', target - timedelta(seconds=10)),
                                  ('wait', target), ('submit', target)])
+
+    def test_opening_rejection_retries_same_seat_and_refreshes_request(self):
+        client = self.client()
+        target = datetime(2026, 10, 20, 20, tzinfo=main.SHANGHAI)
+        client.request = Mock(side_effect=[{'MESSAGE': '超出可预约座位时间范围'},
+                                          {'CODE': 'ok', 'DATA': {'result': 'success', 'bookingId': '9'}}])
+        client.verify = Mock(return_value={'booking_id': '9'})
+        with patch('main.now', return_value=target), patch('main.time.sleep') as sleep:
+            result = client.book_slot(100, 200, [{'id': 62599}], target + timedelta(seconds=4))
+        self.assertTrue(result['submission_confirmed'])
+        sleep.assert_called_once_with(0.4)
+        self.assertEqual([call.kwargs['data']['seats[0]'] for call in client.request.call_args_list], [62599, 62599])
+
+    def test_opening_retries_are_bounded_and_not_used_after_window(self):
+        for timed in (True, False):
+            with self.subTest(timed=timed):
+                client = self.client()
+                target = datetime(2026, 10, 20, 20, tzinfo=main.SHANGHAI)
+                client.request = Mock(return_value={'MESSAGE': '超出可预约座位时间范围'})
+                current = target if timed else target + timedelta(seconds=5)
+                with patch('main.now', return_value=current), patch('main.time.sleep'), \
+                        self.assertRaisesRegex(main.BookingError, '时间范围'):
+                    client.book_slot(100, 200, [{'id': 1}], target + timedelta(seconds=4))
+                self.assertEqual(client.request.call_count, 4 if timed else 1)
+
+    def test_custom_search_does_not_request_unrelated_categories(self):
+        client = self.client()
+        client.categories = {'自习室': '/Seat/Index/searchSeats?a=1', '生活区': '/unused', '阅览室': '/unused2'}
+        client.request = Mock(return_value={'content': [{'seatMap': {
+            'info': {'id': '1558', 'title': '四楼'},
+            'POIs': [{'id': '62599', 'title': '35', 'state': '0'}]}}]})
+        seats = client.available_seats('自定义', 100, 200,
+            {'四楼': {'type': '自习室', 'ranges': [[62565, 62896]]}}, [62599])
+        self.assertEqual([seat['id'] for seat in seats], [62599])
+        self.assertEqual(client.request.call_count, 1)
+
+    def test_backup_reuses_session_and_rechecks_through_reserve_day(self):
+        target = datetime(2026, 10, 20, 20, tzinfo=main.SHANGHAI)
+        args = Mock(date=datetime(2026, 10, 22).date(), at='20:00', backup_at='20:02', check=False, test_booking=False)
+        configs = [{'周四': {'启用': True, 'name': '自定义', '开始时间': 15, '持续小时数': 7}},
+                   {'SeatAutoBooker': {}}, {}]
+        client = Mock()
+        with patch('main.now', return_value=target - timedelta(minutes=5)), \
+                patch('main.read_yaml', side_effect=configs), patch('main.SeatAutoBooker', return_value=client), \
+                patch('main.reserve_day', side_effect=[main.BookingError('本轮失败'), 0]) as reserve, \
+                patch('main.wait_until') as wait:
+            self.assertEqual(main.run(args), 0)
+        client.login.assert_called_once_with(load_categories=False)
+        client.close.assert_called_once()
+        self.assertEqual([call.args[5] for call in reserve.call_args_list], [target, target + timedelta(minutes=2)])
+        wait.assert_called_once_with(target + timedelta(minutes=2, seconds=-20))
+
+    def test_warmup_network_failure_does_not_skip_target_submission(self):
+        target = datetime(2026, 10, 20, 20, tzinfo=main.SHANGHAI)
+        clock = [target - timedelta(seconds=60)]
+        client = Mock()
+        client.bookings.return_value = []
+        client.covered_booking.return_value = None
+        client.get_user_info.side_effect = requests.Timeout()
+        client.book_slot.return_value = {'room': '四楼', 'seat': '35', 'begin': '2026-10-22T15:00:00+08:00', 'booking_id': '9'}
+        def wait(value):
+            clock[0] = max(clock[0], value)
+        with tempfile.TemporaryDirectory() as folder, patch('main.LOCAL', Path(folder)), \
+                patch('main.now', side_effect=lambda: clock[0]), patch('main.wait_until', side_effect=wait):
+            self.assertEqual(main.reserve_day(client, Mock(check=False), {'name': '自定义'}, [(15, 7)],
+                datetime(2026, 10, 22).date(), target, {}, {'自定义': [62599]}), 0)
+        client.available_seats.assert_not_called()
+        client.book_slot.assert_called_once()
+        self.assertEqual(clock[0], target)
+
+    def test_all_24_candidates_can_be_tried_and_limit_takes_precedence(self):
+        client = self.client()
+        client.config['max-retry'] = 24
+        seats = [{'id': seat_id, 'number': str(seat_id)} for seat_id in range(62599, 62623)]
+        client.request = Mock(side_effect=[{'MESSAGE': '座位已被占用'}] * 23 +
+                              [{'CODE': 'ok', 'DATA': {'result': 'success', 'bookingId': '9'}}])
+        client.verify = Mock(return_value={'booking_id': '9'})
+        with patch('main.time.sleep'):
+            self.assertTrue(client.book_slot(100, 200, seats)['submission_confirmed'])
+        self.assertEqual(client.request.call_count, 24)
+        client.verify.assert_called_once_with('9', 100, 200, 62622)
+        client.request = Mock(return_value={'MESSAGE': '操作频繁，未开放'})
+        target = datetime(2026, 10, 20, 20, tzinfo=main.SHANGHAI)
+        with patch('main.now', return_value=target), self.assertRaisesRegex(main.BookingError, '限流'):
+            client.book_slot(100, 200, seats, target + timedelta(seconds=4))
+        self.assertEqual(client.request.call_count, 1)
+
+    def test_early_login_timeout_gets_one_retry_but_password_failure_does_not(self):
+        for message, calls in [('登录等待超时', 2), ('统一身份认证失败：密码错误', 1)]:
+            with self.subTest(message=message):
+                target = datetime(2026, 10, 20, 19, 55, tzinfo=main.SHANGHAI)
+                args = Mock(date=datetime(2026, 10, 22).date(), at='20:00', backup_at=None, check=False, test_booking=False)
+                configs = [{'周四': {'启用': True, 'name': '自定义', '开始时间': 15, '持续小时数': 7}},
+                           {'SeatAutoBooker': {}}, {}]
+                client = Mock()
+                client.login.side_effect = [main.BookingError(message), None]
+                with patch('main.now', return_value=target), patch('main.read_yaml', side_effect=configs), \
+                        patch('main.SeatAutoBooker', return_value=client), patch('main.reserve_day', return_value=0), \
+                        patch('main.time.sleep'):
+                    if calls == 2:
+                        self.assertEqual(main.run(args), 0)
+                    else:
+                        with self.assertRaisesRegex(main.BookingError, '密码错误'):
+                            main.run(args)
+                self.assertEqual(client.login.call_count, calls)
 
 
 if __name__ == '__main__':

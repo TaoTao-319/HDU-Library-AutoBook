@@ -22,9 +22,9 @@ $windowsUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 # Interactive logon lets DPAPI decrypt the password without storing the Windows password.
 $principal = New-ScheduledTaskPrincipal -UserId $windowsUser -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-    -WakeToRun -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 2 -Seconds 30)
+    -WakeToRun -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 8)
 $schedule = @(
-    @{Name='HDU-Library-2000'; Prepare='19:59'; Submit='20:00'},
+    @{Name='HDU-Library-2000'; Prepare='19:55'; Submit='20:00'},
     @{Name='HDU-Library-2002'; Prepare='20:01'; Submit='20:02'}
 )
 foreach ($entry in $schedule) {
@@ -41,5 +41,5 @@ foreach ($taskName in $legacyTaskNames) {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 }
 Get-ScheduledTask -TaskName $taskNames | Select-Object TaskName,State
-Write-Output 'Local tasks installed and ENABLED. Submit times: 20:00 and 20:02 Beijing time (pre-login one minute earlier).'
+Write-Output 'ENABLED: prepare at 19:55, submit at 20:00; reuse session for 20:02 on failure. Independent 20:01 watchdog retained.'
 Write-Output 'Enable the desired booking weekdays in user_config.yml. Logs are stored in logs/.'
