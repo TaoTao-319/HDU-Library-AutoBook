@@ -6,7 +6,7 @@ on:
     branches: [main]
     paths: ['.github/workflows/schedule-probe.yml']
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '2-57/5 * * * *'
 
 permissions:
   actions: write
