@@ -2,9 +2,9 @@ name: Temporary native-schedule booking verification
 
 on:
   schedule:
-    # Temporary test on 2026-10-20 only: Beijing 09:59 and 10:05.
-    - cron: '59 1 * * *'
-    - cron: '5 2 * * *'
+    # Temporary test on 2026-10-20 only: Beijing 10:44 and 10:49.
+    - cron: '44 2 * * *'
+    - cron: '49 2 * * *'
 
 permissions:
   actions: write
