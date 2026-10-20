@@ -429,6 +429,9 @@ def run(args):
         LOG.info('本机执行已停用：当前仅允许 GitHub Actions 云端运行，未登录、未提交预约')
         return 0
     LOG.info('执行环境：%s', 'GitHub Actions 云端' if os.environ.get('GITHUB_ACTIONS') == 'true' else '本机')
+    if os.environ.get('GITHUB_ACTIONS') == 'true':
+        LOG.info('GitHub 触发事件=%s；运行编号=%s', os.environ.get('GITHUB_EVENT_NAME', 'unknown'),
+                 os.environ.get('GITHUB_RUN_ID', 'unknown'))
     seat_config = read_yaml(ROOT / 'config/seat_config.yml')
     target_date = args.date or (now() + timedelta(days=2)).date()
     target_time = None
