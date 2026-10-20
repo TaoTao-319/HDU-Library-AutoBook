@@ -18,6 +18,7 @@ from urllib.parse import urlsplit, parse_qsl
 
 import requests
 import yaml
+from seat_plan import custom_candidates, daily_targets
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options
@@ -43,6 +44,14 @@ class BookingError(RuntimeError):
 
 class AlreadyRunning(BookingError):
     pass
+
+
+class NoSeats(BookingError):
+    """A live map reports no free seats in the allowed fourth-floor pool."""
+
+
+class CandidatesUnavailable(BookingError):
+    """Candidates lost a race; another scheduled round may try a fresh map."""
 
 
 def now():
@@ -120,7 +129,7 @@ def walk(value):
 
 def configured_seats(region, seat_config, custom):
     if region == '自定义':
-        ids = list(dict.fromkeys(int(x) for x in custom))
+        return custom_candidates(custom)
     else:
         names = [region] if region != '不限' else [
             name for name, cfg in seat_config.items() if cfg.get('type') == '自习室' and 'ranges' in cfg]
@@ -190,6 +199,12 @@ class SeatAutoBooker:
             raise BookingError('API 路径无效')
         started = time.perf_counter()
         kwargs.setdefault('timeout', (5, 15))
+        deadline = getattr(self, 'round_deadline', None)
+        if deadline and any(name in path for name in ('/bookSeats', '/searchSeats')):
+            remaining = (deadline - now()).total_seconds()
+            if remaining <= 0:
+                raise BookingError('本轮时间预算已用完，停止新增预约请求')
+            kwargs['timeout'] = (min(2, remaining / 2), min(15, remaining / 2))
         response = self.session.request(method, BASE_URL + path, **kwargs)
         elapsed = (time.perf_counter() - started) * 1000
         response.raise_for_status()
@@ -330,7 +345,8 @@ class SeatAutoBooker:
 
     def available_seats(self, region, begin, duration, seat_config, custom):
         if region == '自定义':
-            allowed = [int(x) for x in custom]
+            ordered = custom_candidates(custom)
+            allowed = [seat['id'] for seat in ordered]
             if not allowed:
                 raise BookingError('自定义座位列表为空')
             # Restrict custom IDs to their configured category; retain a fallback
@@ -341,7 +357,7 @@ class SeatAutoBooker:
                      for first, last in cfg.get('ranges', []) if first <= seat <= last}
             category_names = ([name for name in self.categories if name in types]
                               if known == set(allowed) else list(self.categories))
-            room_id = None
+            room_id = 1558 if isinstance(custom, dict) else None
         elif region == '不限':
             allowed, room_id = None, None
             category_names = [x for x in ('自习室', '阅览室', '生活区') if x in self.categories]
@@ -351,6 +367,7 @@ class SeatAutoBooker:
             cfg = seat_config[region]
             category_names, room_id, allowed = [cfg['type']], int(cfg['room_id']), None
         seats = {}
+        seen_allowed_ids = set()
         for category in category_names:
             if category not in self.categories:
                 continue
@@ -358,6 +375,8 @@ class SeatAutoBooker:
             data = dict(parse_qsl(category_url.query))
             data.update({'beginTime': begin, 'duration': duration, 'num': 1})
             payload = self.request('POST', category_url.path + '?LAB_JSON=1', data=data)
+            if payload.get('CODE') not in (None, 'ok'):
+                raise BookingError(str(payload.get('MESSAGE') or '座位地图查询失败'))
             if payload.get('ui_type') == 'com.Message':
                 raise BookingError(payload.get('MESSAGE', '无法查询座位'))
             if payload.get('IsImgCode'):
@@ -371,13 +390,18 @@ class SeatAutoBooker:
                     continue
                 for poi in seat_map.get('POIs', []):
                     seat_id = int(poi['id'])
+                    if allowed is not None and seat_id in allowed:
+                        seen_allowed_ids.add(seat_id)
                     free = str(poi.get('state')) == '0' or (str(poi.get('state')) == '2' and poi.get('recommend'))
                     if free and (allowed is None or seat_id in allowed):
                         seats[seat_id] = {'id': seat_id, 'number': poi['title'], 'room': info['title']}
             if seats and region == '不限':
                 break
         if allowed:
-            return [seats[x] for x in allowed if x in seats]
+            if isinstance(custom, dict) and not seen_allowed_ids:
+                raise BookingError('未获取到有效的四楼座位地图，不能判定满座')
+            metadata = {seat['id']: seat for seat in ordered}
+            return [dict(metadata[x], **seats[x]) for x in allowed if x in seats]
         result = list(seats.values())
         random.shuffle(result)
         return result
@@ -407,6 +431,9 @@ class SeatAutoBooker:
         candidates = deque(seats[:attempts])
         window_retries = 0
         while candidates:
+            deadline = getattr(self, 'round_deadline', None)
+            if deadline and now() >= deadline:
+                raise BookingError('本轮时间预算已用完，等待下一轮')
             seat = candidates.popleft()
             data = {'api_time': int(time.time()), 'beginTime': begin, 'duration': duration,
                     'is_recommend': 0, 'seatBookers[0]': self.uid, 'seats[0]': seat['id']}
@@ -445,7 +472,26 @@ class SeatAutoBooker:
                 time.sleep(0.3)
                 continue
             raise BookingError('预约被拒绝：' + message)
-        raise BookingError('候选座位均已不可用，等待下一轮补跑')
+        raise CandidatesUnavailable('候选座位均已不可用，等待下一轮补跑')
+
+    def book_fourth_floor(self, begin, duration, seats, custom, seat_config, opening_deadline=None):
+        rejected = set()
+        # At release, immediately try one random top-tier seat. A collision
+        # triggers one live map, rather than hundreds of speculative POSTs.
+        if opening_deadline and now() < opening_deadline:
+            try:
+                return self.book_slot(begin, duration, seats[:1], opening_deadline)
+            except CandidatesUnavailable:
+                rejected.add(seats[0]['id'])
+        if not self.categories:
+            self.load_categories()
+        available = self.available_seats('自定义', begin, duration, seat_config, custom)
+        if not available:
+            raise NoSeats('四楼该时段没有可用座位，结束今日预约')
+        available = [seat for seat in available if seat['id'] not in rejected]
+        if not available:
+            raise CandidatesUnavailable('地图候选刚被占用，等待下一轮刷新')
+        return self.book_slot(begin, duration, available)
 
 
 def parse_args():
@@ -453,10 +499,11 @@ def parse_args():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--check', action='store_true', help='只验证登录和座位，不提交')
     mode.add_argument('--test-booking', action='store_true', help='忽略星期开关，真实预约一个测试时段')
+    mode.add_argument('--daily', action='store_true', help='复用会话执行配置的五轮预约')
     parser.add_argument('--date', type=lambda s: datetime.strptime(s, '%Y-%m-%d').date())
     parser.add_argument('--start', type=float, default=7)
     parser.add_argument('--hours', type=float, default=1)
-    parser.add_argument('--region', default='二楼西')
+    parser.add_argument('--region', default='自定义')
     parser.add_argument('--at', choices=['20:00', '20:02'], help='提前登录，等到今天的目标时刻提交')
     parser.add_argument('--backup-at', choices=['20:02'], help='失败后复用当前会话等待补跑')
     return parser.parse_args()
@@ -472,9 +519,14 @@ def reserve_day(client, args, day, slots, target_date, target_time, seat_config,
         duplicate = client.covered_booking(existing, begin, duration)
         if duplicate:
             LOG.info('时段已有预约，核验订单 %s', duplicate['id'])
-            prepared.append((begin, duration, [], client.verify(duplicate['id'])))
+            verified = client.verify(duplicate['id'])
+            if (isinstance(user_config.get('自定义'), dict)
+                    and int(verified.get('seat_id', 0)) not in
+                    {seat['id'] for seat in custom_candidates(user_config['自定义'])}):
+                raise BookingError('已有覆盖订单不在当前四楼范围，请先在网页处理')
+            prepared.append((begin, duration, [], verified))
             continue
-        if target_time and not args.check:
+        if (target_time or isinstance(user_config.get('自定义'), dict)) and not args.check:
             # Candidate IDs are sufficient for submission; the server decides
             # availability. Avoid slow maps and stale pre-release snapshots.
             seats = configured_seats(day['name'], seat_config, user_config.get('自定义', []))
@@ -501,8 +553,14 @@ def reserve_day(client, args, day, slots, target_date, target_time, seat_config,
     results = []
     for begin, duration, seats, duplicate in prepared:
         opening_deadline = (target_time + timedelta(seconds=4)
-                            if target_time and target_time.strftime('%H:%M') == '20:00' else None)
-        result = duplicate or client.book_slot(begin, duration, seats, opening_deadline=opening_deadline)
+                            if target_time and target_time.strftime('%H:%M:%S') == '20:00:00' else None)
+        custom = user_config.get('自定义', [])
+        if duplicate:
+            result = duplicate
+        elif day['name'] == '自定义' and isinstance(custom, dict):
+            result = client.book_fourth_floor(begin, duration, seats, custom, seat_config, opening_deadline)
+        else:
+            result = client.book_slot(begin, duration, seats, opening_deadline=opening_deadline)
         result['already_existed'] = duplicate is not None
         result.setdefault('submission_confirmed', False)
         result['trigger_event'] = os.environ.get('GITHUB_EVENT_NAME', 'local')
@@ -513,6 +571,74 @@ def reserve_day(client, args, day, slots, target_date, target_time, seat_config,
         report = LOCAL / ('booking-' + now().strftime('%Y%m%d-%H%M%S-%f') + '.json')
         report.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8')
     return 0
+
+
+def login_for_target(client, target_time, load_categories):
+    for attempt in range(2):
+        try:
+            client.login(load_categories=load_categories)
+            return
+        except (BookingError, requests.RequestException) as error:
+            transient = isinstance(error, requests.RequestException) or '登录等待超时' in str(error)
+            if attempt or not transient or not target_time or now() >= target_time - timedelta(seconds=60):
+                raise
+            LOG.warning('提前登录暂时失败，2 秒后重试一次：%s', type(error).__name__)
+            time.sleep(2)
+
+
+def run_daily(client, args, day, slots, target_date, seat_config, user_config):
+    targets = daily_targets(now(), user_config['自动预约'])
+    cutoff = now().replace(hour=20, minute=15, second=0, microsecond=0)
+    LOCAL.mkdir(exist_ok=True)
+    state_path = LOCAL / ('daily-state-' + now().strftime('%Y-%m-%d') + '.json')
+    state = json.loads(state_path.read_text(encoding='utf-8')) if state_path.exists() else {'attempted': []}
+    def checkpoint():
+        temporary = state_path.with_suffix('.tmp')
+        temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
+        os.replace(temporary, state_path)
+    if state.get('finished'):
+        LOG.info('今日计划已结束：%s', state['finished'])
+        return 0
+    logged_in = False
+    for index, target in enumerate(targets, 1):
+        key = target.isoformat()
+        if key in state['attempted']:
+            LOG.info('第 %d/5 轮已执行过，避免进程重启后重复运行', index)
+            continue
+        deadline = min(target + timedelta(seconds=20), cutoff)
+        if now() >= deadline:
+            LOG.warning('第 %d/5 轮已过期，跳过 %s', index, target.isoformat())
+            continue
+        if index > 1:
+            wait_until(target - timedelta(seconds=20))
+        state['attempted'].append(key)
+        checkpoint()
+        client.round_deadline = deadline
+        LOG.info('第 %d/5 轮，目标 %s；复用会话=%s', index, target.isoformat(), logged_in)
+        try:
+            if not logged_in:
+                login_for_target(client, target, load_categories=True)
+                logged_in = True
+            if now() >= deadline:
+                raise BookingError('本轮准备超时，留待下一轮')
+            result = reserve_day(client, args, day, slots, target_date, target, seat_config, user_config)
+            state['finished'] = '预约已确认或已有覆盖订单'
+            checkpoint()
+            return result
+        except NoSeats as error:
+            state['finished'] = '四楼无可用座位'
+            checkpoint()
+            LOG.info('%s', error)
+            return 0
+        except (BookingError, requests.RequestException) as error:
+            LOG.warning('第 %d/5 轮未成功：%s', index, error)
+            if any(word in str(error) for word in ('统一身份认证失败', '验证码', '无法解密',
+                    '请设置 SCHOOL_ID', '已有覆盖订单不在', '与已有预约部分重叠', '已有其他预约')):
+                raise
+            if '会话失效' in str(error) or '登录状态验证失败' in str(error):
+                logged_in = False
+    LOG.error('今日五轮已结束，没有确认新预约')
+    return 1
 
 
 def run(args):
@@ -542,18 +668,22 @@ def run(args):
         if now() > target_time + timedelta(seconds=30):
             raise BookingError('定时目标已过期超过 30 秒，本轮退出')
     slots = get_time_slots(day)
+    daily = getattr(args, 'daily', False) is True
+    if daily and (args.at or isinstance(getattr(args, 'backup_at', None), str)):
+        raise BookingError('--daily 不能与 --at/--backup-at 同用')
+    custom = user_config.get('自定义', [])
+    if daily and (day['name'] != '自定义' or not isinstance(custom, dict)):
+        raise BookingError('每日五轮只允许四楼分级区间配置')
+    if isinstance(custom, dict):
+        custom_candidates(custom)  # Validate the full pool before any login.
+        if not args.check and day['name'] != '自定义':
+            raise BookingError('当前配置只允许预约四楼分级自定义座位')
     client = SeatAutoBooker(basic)
     try:
-        for attempt in range(2):
-            try:
-                client.login(load_categories=target_time is None or args.check)
-                break
-            except (BookingError, requests.RequestException) as error:
-                transient = isinstance(error, requests.RequestException) or '登录等待超时' in str(error)
-                if attempt or not transient or not target_time or now() >= target_time - timedelta(seconds=60):
-                    raise
-                LOG.warning('提前登录暂时失败，2 秒后重试一次：%s', type(error).__name__)
-                time.sleep(2)
+        if daily:
+            return run_daily(client, args, day, slots, target_date, seat_config, user_config)
+        login_for_target(client, target_time,
+                         load_categories=target_time is None or args.check or isinstance(custom, dict))
         targets = [target_time]
         backup = getattr(args, 'backup_at', None)
         if isinstance(backup, str):
@@ -563,6 +693,9 @@ def run(args):
         for index, target in enumerate(targets):
             try:
                 return reserve_day(client, args, day, slots, target_date, target, seat_config, user_config)
+            except NoSeats as error:
+                LOG.info('%s', error)
+                return 0
             except (BookingError, requests.RequestException) as error:
                 if index == len(targets) - 1:
                     raise

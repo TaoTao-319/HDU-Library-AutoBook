@@ -10,7 +10,7 @@ def verify_native_booking(report_dir, event, run_id):
     reports = []
     for path in Path(report_dir).glob('booking-*.json'):
         reports.extend(json.loads(path.read_text(encoding='utf-8')))
-    allowed_seats = {str(seat_id) for seat_id in range(62599, 62623)}
+    allowed_seats = {str(seat_id) for seat_id in range(62565, 62897)}
     confirmed = [order for order in reports
                  if order.get('github_run_id') == run_id
                  and order.get('trigger_event') == 'schedule'

@@ -128,7 +128,7 @@ except main.AlreadyRunning:
                 with self.subTest(event=event, run_id=run_id), self.assertRaises(ValueError):
                     verify_native_booking(folder, event, run_id)
             for changes in [{'already_existed': True}, {'submission_confirmed': False},
-                            {'seat_id': 62598}, {'seat_id': 62623}, {'trigger_event': 'workflow_dispatch'}]:
+                            {'seat_id': 62564}, {'seat_id': 62897}, {'trigger_event': 'workflow_dispatch'}]:
                 report.write_text(json.dumps([dict(confirmed, **changes)]), encoding='utf-8')
                 with self.subTest(changes=changes), self.assertRaises(ValueError):
                     verify_native_booking(folder, 'schedule', '77')
