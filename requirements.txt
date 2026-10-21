@@ -1,3 +1,4 @@
 requests==2.34.2
 PyYAML==6.0.3
 selenium==4.51.0
+pycryptodome==3.23.0

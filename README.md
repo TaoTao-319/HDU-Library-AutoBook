@@ -81,7 +81,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-Schedule.ps1
 .\.venv\Scripts\python.exe .\main.py --check --start 15 --hours 7
 
 # 预约逻辑离线回归，不登录、不提交
-.\.venv\Scripts\python.exe -m unittest test_main test_seat_plan test_submission_safety
+.\.venv\Scripts\python.exe -m unittest test_main test_seat_plan test_submission_safety test_native_schedule test_cas_auth
 
 # DeepSeek 协作工具离线回归，不调用付费 API
 .\.venv\Scripts\python.exe -m unittest discover -s scripts -p test_deepseek_collab.py
@@ -108,3 +108,5 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-Schedule.ps1
 [2026-10-21 16:00 的测试运行](https://github.com/TaoTao-319/HDU-Library-AutoBook/actions/runs/39566063473) 已确认由 `schedule` 触发，之后在学校 SSO 登录等待阶段失败。因此已有原生定时投递证据，尚不能据此认定原生定时预约成功。本地、不同 GitHub runner 和不同仓库之间没有共享本地锁，不能将各端“五轮上限”理解为全局五轮。
 
 首轮审查的历史记录见 [预约脚本审查](docs/REVIEW-2026-10-21.md) 和 [首轮 API 失败记录](docs/DEEPSEEK-CONTACT-2026-10-21.md)。用户随后授权改进调用工具并继续交流，本次已有两条真实 DeepSeek 回复，待确认提交与恢复验证已经落实到代码；详见 [实现与复审记录](docs/DEEPSEEK-IMPLEMENTATION-2026-10-21.md)。预约逻辑 49 项、协作工具 12 项离线测试通过。本轮没有实际登录学校或创建预约，真实高峰效果仍待后续运行验证。
+
+后续原生真实测试已配置为 **2026-10-22 周四 07:00–08:00**，仅 `schedule` 首次执行可领取测试，并按用户授权处理指定旧测试单；详情与当前验收状态见 [原生测试计划](docs/NATIVE-TEST-2026-10-22.md)。已增加云端浏览器超时后的 HTTP CAS 回退和相关验证，预约相关离线检查现为 61 项；这些离线成绩不计作真实预约成功。

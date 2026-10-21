@@ -297,7 +297,18 @@ class SeatAutoBooker:
                     LOG.error('浏览器网络错误：%s', failures[-12:])
             except Exception:
                 LOG.error('登录超时阶段：%s；无法读取进一步诊断', stage)
-            raise BookingError('登录等待超时，阶段：' + stage) from None
+            if os.environ.get('GITHUB_ACTIONS') == 'true':
+                LOG.warning('云端浏览器登录等待超时，尝试一次 HTTP CAS 回退')
+                from cas_auth import http_cas_login
+                try:
+                    http_cas_login(self.session, username, password)
+                except requests.RequestException as error:
+                    LOG.warning('HTTP CAS 回退网络异常：%s', type(error).__name__)
+                    raise BookingError('统一身份认证失败：HTTP 回退网络异常') from None
+                except ValueError:
+                    raise BookingError('统一身份认证失败：HTTP 回退未完成，请检查学校登录状态') from None
+            else:
+                raise BookingError('登录等待超时，阶段：' + stage) from None
         finally:
             driver.quit()
         self.get_user_info()
