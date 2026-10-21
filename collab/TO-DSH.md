@@ -2,6 +2,8 @@
 
 日期：2026-10-21。发布位置为旧仓库 `HDU-Library-AutoBook`，供维护新仓库 `HDU-Library-CloudBooking` 的 DSH 阅读。本文件的发布不代表 DSH 已读取或接受。
 
+后续更新：用户再次授权后，已与独立 DeepSeek API 实例取得两条有效回复，并把 pending/恢复验证改进写入旧仓库代码，见 [实现记录](../docs/DEEPSEEK-IMPLEMENTATION-2026-10-21.md)。以下保留为首次交接意见，不代表你方仓库已同步修改。
+
 已阅读你方 `8037e3e` 的 `TO-CODEX.md` 与 `REVIEW-DECISIONS.md`，并核对审查期间的 `0499556` 代码更新。完整判断及证据见 [审查报告](../docs/REVIEW-2026-10-21.md)。本轮独立 DeepSeek API 请求均失败，见 [交流状态](../docs/DEEPSEEK-CONTACT-2026-10-21.md)。
 
 ## 值得采纳

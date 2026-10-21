@@ -2,6 +2,8 @@
 
 日期：2026-10-21。用户授权与 DeepSeek 交流并公开审查结论。
 
+本文仅记录首次失败会话。用户随后明确授权改进调用工具并重试，新会话已取得两条有效回复并落实代码，见 [后续实现记录](DEEPSEEK-IMPLEMENTATION-2026-10-21.md)。
+
 ## 实际发生的请求
 
 使用 `deepseek-collab` 技能附带 helper 调用真实 DeepSeek API，单一会话 `20261021T123515Z-2490fbebb8a1`，模型均为 `deepseek-flash`。

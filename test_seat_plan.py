@@ -86,6 +86,7 @@ class SeatPlanTests(unittest.TestCase):
         start = datetime(2026, 10, 21, 19, 55, tzinfo=main.SHANGHAI)
         clock = [start]
         client = Mock()
+        client.has_pending.return_value = False
         def wait(target):
             clock[0] = max(clock[0], target)
         def reserve(*args):
@@ -119,6 +120,7 @@ class SeatPlanTests(unittest.TestCase):
     def test_expired_plan_never_logs_in_or_submits(self):
         end = datetime(2026, 10, 21, 20, 16, tzinfo=main.SHANGHAI)
         client = Mock()
+        client.has_pending.return_value = False
         with tempfile.TemporaryDirectory() as folder, patch('main.LOCAL', Path(folder)), \
                 patch('main.now', return_value=end), patch('main.reserve_day') as reserve:
             self.assertEqual(main.run_daily(client, Mock(), {}, [], end.date(), {}, self.config), 1)
@@ -155,6 +157,7 @@ class SeatPlanTests(unittest.TestCase):
 
     def test_round_deadline_blocks_further_submission(self):
         client = main.SeatAutoBooker({'max-retry': 332})
+        client.uid = 123
         self.addCleanup(client.close)
         client.round_deadline = main.now() - timedelta(seconds=1)
         client.request = Mock()

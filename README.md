@@ -80,13 +80,26 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-Schedule.ps1
 # 只读检查：四楼，默认后天，以下指定15:00起7小时，不提交预约
 .\.venv\Scripts\python.exe .\main.py --check --start 15 --hours 7
 
-# 离线回归，不登录、不提交
-.\.venv\Scripts\python.exe -m unittest test_main test_seat_plan
+# 预约逻辑离线回归，不登录、不提交
+.\.venv\Scripts\python.exe -m unittest test_main test_seat_plan test_submission_safety
+
+# DeepSeek 协作工具离线回归，不调用付费 API
+.\.venv\Scripts\python.exe -m unittest discover -s scripts -p test_deepseek_collab.py
 ```
 
 配置文件按 UTF-8 读取，路径相对脚本目录。`.local/credentials.xml` 使用 Windows DPAPI 加密，只有当前 Windows 用户在当前电脑可解密；可运行 `Save-Credential.ps1` 重新保存。本机凭据、日志和虚拟环境都已被 Git 忽略。`SCHOOL_ID`、`PASSWORD` 环境变量优先于本机凭据。
 
-本机日志位于 `logs/YYYY-MM-DD.log`，订单结果写入 `.local/booking-*.json`。正常新单成功路径要求服务端明确返回成功及订单编号，并查询详情核验所有者、日期、时长和座位；超时恢复、已有订单等分支仍有需要统一核验的条件，详见下方审查。验证码或密码错误不会通过反复尝试解决。不能保证外部网络、学校服务和热门座位竞争下每次都预约成功。
+本机日志位于 `logs/YYYY-MM-DD.log`，订单结果写入 `.local/booking-*.json`。新单核验所有者、有效状态、精确时段及座位；已有覆盖单允许时间更长，但详情必须覆盖目标时段并位于允许座位池。恢复确认的订单明确标记为 `recovered`，不会当成本轮新建成功。验证码或密码错误不会通过反复尝试解决。不能保证外部网络、学校服务和热门座位竞争下每次都预约成功。
+
+### 提交结果未知时的恢复
+
+预约 POST 前，脚本先把账号级待确认记录原子保存到 `.local/pending-*.json`。超时、非 JSON、异常结构、成功但缺少订单编号、订单详情核验失败时，都保留记录并停止新增提交；收到订单号时先保存编号，再核验详情。即使当天轮次已记录完成，重启后也会优先登录并只读恢复未决记录。
+
+已核验订单另存 `.local/verified-*.json`，然后才清除 pending；若服务端列表暂未显示订单，下次仍可根据该提示重新查询详情，避免忘掉刚确认的订单。明确的座位占用、未开放等拒绝响应仍遵循原有有限换座或退避。单独出现“稍后”等模糊信息不构成未成交证据。
+
+如果始终无法确认，脚本保持停止新提交，需先在网页核对再人工处理本地记录；不要直接删除待确认文件来强行重试。这项取舍优先避免重复提交，可能减少网络异常后的自动补跑机会。
+
+这些记录与文件锁只在当前工作目录有效。GitHub 全新 runner 不会自动继承上个 job 的文件，也不与其他仓库或电脑共享记录，仍需后续设计主端接管或共享租约。
 
 ## 2026-10-21 状态与审查
 
@@ -94,4 +107,4 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-Schedule.ps1
 
 [2026-10-21 16:00 的测试运行](https://github.com/TaoTao-319/HDU-Library-AutoBook/actions/runs/39566063473) 已确认由 `schedule` 触发，之后在学校 SSO 登录等待阶段失败。因此已有原生定时投递证据，尚不能据此认定原生定时预约成功。本地、不同 GitHub runner 和不同仓库之间没有共享本地锁，不能将各端“五轮上限”理解为全局五轮。
 
-本次重新运行现有离线回归，37 项通过；另用无网络的合成响应确认恢复核验缺口及部分地图判断路径。可取设计、待改进项与验证边界见 [预约脚本审查](docs/REVIEW-2026-10-21.md)，待 DeepSeek 桌面维护端阅读的反馈见 [TO-DSH](collab/TO-DSH.md)。本轮 DeepSeek API 三次尝试均未取得有效回复，详见 [交流状态](docs/DEEPSEEK-CONTACT-2026-10-21.md)；本次发布只更新文档，没有修改执行行为。
+首轮审查的历史记录见 [预约脚本审查](docs/REVIEW-2026-10-21.md) 和 [首轮 API 失败记录](docs/DEEPSEEK-CONTACT-2026-10-21.md)。用户随后授权改进调用工具并继续交流，本次已有两条真实 DeepSeek 回复，待确认提交与恢复验证已经落实到代码；详见 [实现与复审记录](docs/DEEPSEEK-IMPLEMENTATION-2026-10-21.md)。预约逻辑 49 项、协作工具 12 项离线测试通过。本轮没有实际登录学校或创建预约，真实高峰效果仍待后续运行验证。

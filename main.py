@@ -19,6 +19,7 @@ from urllib.parse import urlsplit, parse_qsl
 import requests
 import yaml
 from seat_plan import custom_candidates, daily_targets
+from submission_state import SubmissionJournal, atomic_json
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options
@@ -44,6 +45,10 @@ class BookingError(RuntimeError):
 
 class AlreadyRunning(BookingError):
     pass
+
+
+class SubmissionUncertain(BookingError):
+    """A POST may have committed; permit only read-only recovery."""
 
 
 class NoSeats(BookingError):
@@ -190,6 +195,8 @@ class SeatAutoBooker:
         })
         self.uid = None
         self.categories = {}
+        self.allowed_seat_ids = None
+        self.baseline_ids = set()
 
     def close(self):
         self.session.close()
@@ -406,25 +413,72 @@ class SeatAutoBooker:
         random.shuffle(result)
         return result
 
-    def verify(self, booking_id, begin=None, duration=None, seat_id=None):
+    def verify(self, booking_id, begin=None, duration=None, seat_id=None, *, covers=False):
         payload = self.request('GET', f'/Seat/Index/bookingInfo?bookingId={int(booking_id)}&LAB_JSON=1')
         booking = payload.get('data', {}).get('booking', {})
         if (str(booking.get('id')) != str(booking_id)
                 or str(booking.get('status')) not in ACTIVE_STATUSES
                 or int(booking.get('user', {}).get('id', 0)) != self.uid):
             raise BookingError('订单详情验证失败')
-        if begin is not None and int(booking['begin_time']) != begin:
-            raise BookingError('订单开始时间不符')
-        if duration is not None and int(booking['duration']) != duration:
-            raise BookingError('订单持续时间不符')
+        if covers:
+            if (begin is None or duration is None
+                    or int(booking['begin_time']) > begin
+                    or int(booking['begin_time']) + int(booking['duration']) < begin + duration):
+                raise BookingError('订单详情未覆盖目标时段')
+        else:
+            if begin is not None and int(booking['begin_time']) != begin:
+                raise BookingError('订单开始时间不符')
+            if duration is not None and int(booking['duration']) != duration:
+                raise BookingError('订单持续时间不符')
         if seat_id is not None and int(booking.get('seat', {}).get('id', 0)) != seat_id:
             raise BookingError('订单座位不符')
+        if (self.allowed_seat_ids is not None
+                and int(booking.get('seat', {}).get('id', 0)) not in self.allowed_seat_ids):
+            raise BookingError('已有覆盖订单不在当前允许座位范围，请先在网页处理')
         return {'booking_id': str(booking_id), 'room': booking['space']['title'],
                 'seat': booking['seat']['title'], 'seat_id': booking['seat']['id'],
                 'begin': datetime.fromtimestamp(int(booking['begin_time']), SHANGHAI).isoformat(),
                 'duration': int(booking['duration']), 'status': str(booking['status'])}
 
+    def has_pending(self):
+        return any(LOCAL.glob('pending-*.json'))
+
+    def recover_pending(self):
+        """Resolve an old intent before daily-state skips or any new POST."""
+        journal = SubmissionJournal(LOCAL, self.uid)
+        try:
+            intent = journal.load()
+            if intent is None:
+                return None
+            if intent.get('booking_id'):
+                result = self.verify(intent['booking_id'], intent['begin'],
+                                     intent['duration'], intent['seat_id'])
+            else:
+                existing = self.covered_booking(self.bookings(), intent['begin'], intent['duration'])
+                if not existing:
+                    raise SubmissionUncertain('预约提交结果仍未确认，停止新增预约；请在网页核对待确认记录')
+                result = self.verify(existing['id'], intent['begin'], intent['duration'], covers=True)
+            # A read-only recovery cannot prove this run created the order.
+            result.update(submission_confirmed=False,
+                          already_existed=str(result['booking_id']) in intent['baseline_ids'],
+                          outcome='recovered', trigger_event=os.environ.get('GITHUB_EVENT_NAME', 'local'),
+                          github_run_id=os.environ.get('GITHUB_RUN_ID', ''))
+            atomic_json(LOCAL / ('booking-recovery-' + intent['intent_id'] + '.json'), [result])
+            journal.complete(intent, result)
+            LOG.info('只读恢复确认了覆盖订单 %s；不计为本轮新建订单', result['booking_id'])
+            return result
+        except (BookingError, requests.RequestException, ValueError, KeyError, OSError, TypeError) as error:
+            raise SubmissionUncertain('待确认预约无法完成核验，停止新增提交；' + type(error).__name__) from None
+
+    def cached_bookings(self):
+        return SubmissionJournal(LOCAL, self.uid).verified_bookings()
+
     def book_slot(self, begin, duration, seats, opening_deadline=None):
+        recovered = self.recover_pending()
+        if recovered:
+            recovered_begin = int(datetime.fromisoformat(recovered['begin']).timestamp())
+            if recovered_begin <= begin and recovered_begin + recovered['duration'] >= begin + duration:
+                return recovered
         attempts = min(int(self.config.get('max-retry', 5)), len(seats))
         if attempts <= 0:
             raise BookingError('没有符合条件的空闲座位')
@@ -437,20 +491,46 @@ class SeatAutoBooker:
             seat = candidates.popleft()
             data = {'api_time': int(time.time()), 'beginTime': begin, 'duration': duration,
                     'is_recommend': 0, 'seatBookers[0]': self.uid, 'seats[0]': seat['id']}
+            journal = SubmissionJournal(LOCAL, self.uid)
+            try:
+                intent = journal.start(data, self.baseline_ids)
+            except (ValueError, OSError) as error:
+                raise SubmissionUncertain('无法可靠记录提交状态，未发送预约；' + type(error).__name__) from None
+            if deadline and now() >= deadline:
+                journal.clear(intent)  # No POST was sent, so there is no ambiguity.
+                raise BookingError('本轮时间预算已用完，停止新增预约请求')
             try:
                 payload = self.request('POST', BOOK_PATH, data=data, headers={'Api-Token': booking_token(data)})
-            except requests.RequestException:
-                existing = self.covered_booking(self.bookings(), begin, duration)
-                if existing:
-                    return self.verify(existing['id'])
-                raise BookingError('预约网络异常，查单未发现订单；停止提交，等待下一轮补跑') from None
+            except (requests.RequestException, BookingError):
+                return self.recover_pending()
             result = payload.get('DATA', {})
+            if not isinstance(result, dict):
+                raise SubmissionUncertain('预约响应结构异常，保留待确认记录，停止新增提交')
             if payload.get('CODE') == 'ok' and result.get('result') == 'success' and result.get('bookingId'):
-                verified = self.verify(result['bookingId'], begin, duration, seat['id'])
+                try:
+                    journal.accepted(intent, result['bookingId'])
+                    verified = self.verify(result['bookingId'], begin, duration, seat['id'])
+                    journal.complete(intent, verified)
+                except (BookingError, requests.RequestException, ValueError, KeyError, OSError, TypeError) as error:
+                    raise SubmissionUncertain('服务端已返回订单号但核验未完成，停止新增提交；' + type(error).__name__) from None
                 verified['submission_confirmed'] = True
+                verified['outcome'] = 'confirmed_new'
                 LOG.info('新预约提交已获服务器确认并通过查单：订单 %s', result['bookingId'])
                 return verified
             message = str(result.get('msg') or payload.get('MESSAGE') or '预约失败')
+            if any(key in message for key in ('已有预约', '重复预约', '已存在预约', '请先取消')):
+                return self.recover_pending()
+            # Only recognised, explicit non-commit responses permit another POST.
+            rejected = ('操作频繁', '请求太频繁', '超出可预约座位时间范围', '未开放', '未到预约',
+                        '座位已被占用', '座位已被预约', '座位不可用', '座位不存在', '时长不合法', '参数错误')
+            explicit_rejection = (payload.get('CODE') in ('error', 'fail', 'failed')
+                                  or result.get('result') == 'failure'
+                                  or message in ('超出可预约座位时间范围', '操作频繁',
+                                                 '操作频繁，未开放', '座位已被占用'))
+            if (result.get('result') == 'success' or result.get('bookingId')
+                    or not explicit_rejection or not any(key in message for key in rejected)):
+                raise SubmissionUncertain('预约响应未能证明拒绝成交，保留待确认记录，停止新增提交')
+            journal.clear(intent)
             if any(key in message for key in ('频繁', '人数过多', '稍后')):
                 raise BookingError('服务限流，等待下一轮补跑：' + message)
             if (opening_deadline and now() < opening_deadline and window_retries < 3
@@ -462,11 +542,6 @@ class SeatAutoBooker:
                     candidates.appendleft(seat)
                     window_retries += 1
                     continue
-            if any(key in message for key in ('已有预约', '重复预约', '已存在预约', '请先取消')):
-                existing = self.covered_booking(self.bookings(), begin, duration)
-                if existing:
-                    return self.verify(existing['id'])
-                raise BookingError('已有其他预约，请核对预约记录：' + message)
             if any(key in message for key in ('已被', '占用', '不可用', '不存在', '冲突', '已预约')):
                 LOG.warning('座位 %s 不可约：%s', seat['number'], message)
                 time.sleep(0.3)
@@ -510,7 +585,18 @@ def parse_args():
 
 
 def reserve_day(client, args, day, slots, target_date, target_time, seat_config, user_config):
+    client.recover_pending()
     existing = client.bookings()
+    cached = client.cached_bookings()
+    if isinstance(cached, list):
+        known_ids = {str(item['id']) for item in existing}
+        for item in cached:
+            if str(item['booking_id']) not in known_ids:
+                existing.append({'id': item['booking_id'], 'status': item['status'],
+                                 'time': int(datetime.fromisoformat(item['begin']).timestamp()),
+                                 'duration': item['duration']})
+                known_ids.add(str(item['booking_id']))
+    client.baseline_ids = {str(item['id']) for item in existing}
     prepared = []
     midnight = datetime.combine(target_date, datetime.min.time(), SHANGHAI)
     for start, hours in slots:
@@ -519,7 +605,7 @@ def reserve_day(client, args, day, slots, target_date, target_time, seat_config,
         duplicate = client.covered_booking(existing, begin, duration)
         if duplicate:
             LOG.info('时段已有预约，核验订单 %s', duplicate['id'])
-            verified = client.verify(duplicate['id'])
+            verified = client.verify(duplicate['id'], begin, duration, covers=True)
             if (isinstance(user_config.get('自定义'), dict)
                     and int(verified.get('seat_id', 0)) not in
                     {seat['id'] for seat in custom_candidates(user_config['自定义'])}):
@@ -561,8 +647,9 @@ def reserve_day(client, args, day, slots, target_date, target_time, seat_config,
             result = client.book_fourth_floor(begin, duration, seats, custom, seat_config, opening_deadline)
         else:
             result = client.book_slot(begin, duration, seats, opening_deadline=opening_deadline)
-        result['already_existed'] = duplicate is not None
+        result.setdefault('already_existed', duplicate is not None)
         result.setdefault('submission_confirmed', False)
+        result.setdefault('outcome', 'already_covered' if duplicate else 'recovered')
         result['trigger_event'] = os.environ.get('GITHUB_EVENT_NAME', 'local')
         result['github_run_id'] = os.environ.get('GITHUB_RUN_ID', '')
         LOG.info('预约已核实：%s %s号座，%s，订单 %s', result['room'], result['seat'], result['begin'], result['booking_id'])
@@ -592,6 +679,11 @@ def run_daily(client, args, day, slots, target_date, seat_config, user_config):
     LOCAL.mkdir(exist_ok=True)
     state_path = LOCAL / ('daily-state-' + now().strftime('%Y-%m-%d') + '.json')
     state = json.loads(state_path.read_text(encoding='utf-8')) if state_path.exists() else {'attempted': []}
+    logged_in = False
+    if client.has_pending():
+        login_for_target(client, None, load_categories=False)
+        logged_in = True
+        client.recover_pending()  # Even if all rounds or the day were recorded finished.
     def checkpoint():
         temporary = state_path.with_suffix('.tmp')
         temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -599,7 +691,6 @@ def run_daily(client, args, day, slots, target_date, seat_config, user_config):
     if state.get('finished'):
         LOG.info('今日计划已结束：%s', state['finished'])
         return 0
-    logged_in = False
     for index, target in enumerate(targets, 1):
         key = target.isoformat()
         if key in state['attempted']:
@@ -625,6 +716,8 @@ def run_daily(client, args, day, slots, target_date, seat_config, user_config):
             state['finished'] = '预约已确认或已有覆盖订单'
             checkpoint()
             return result
+        except SubmissionUncertain:
+            raise
         except NoSeats as error:
             state['finished'] = '四楼无可用座位'
             checkpoint()
@@ -679,6 +772,8 @@ def run(args):
         if not args.check and day['name'] != '自定义':
             raise BookingError('当前配置只允许预约四楼分级自定义座位')
     client = SeatAutoBooker(basic)
+    client.allowed_seat_ids = {seat['id'] for seat in configured_seats(
+        day['name'], seat_config, custom)}
     try:
         if daily:
             return run_daily(client, args, day, slots, target_date, seat_config, user_config)
@@ -693,6 +788,8 @@ def run(args):
         for index, target in enumerate(targets):
             try:
                 return reserve_day(client, args, day, slots, target_date, target, seat_config, user_config)
+            except SubmissionUncertain:
+                raise
             except NoSeats as error:
                 LOG.info('%s', error)
                 return 0

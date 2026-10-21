@@ -16,6 +16,12 @@ from scripts.verify_native_booking import verify_native_booking
 
 
 class BookingTests(unittest.TestCase):
+    def setUp(self):
+        self.local = tempfile.TemporaryDirectory()
+        self.addCleanup(self.local.cleanup)
+        patcher = patch('main.LOCAL', Path(self.local.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
     def test_second_process_skips_locked_booking_and_can_run_after_release(self):
         code = """import os
 from pathlib import Path
@@ -96,7 +102,7 @@ except main.AlreadyRunning:
         client = self.client()
         client.request = Mock(return_value={'CODE': 'error', 'MESSAGE': '操作频繁'})
         with self.assertRaisesRegex(main.BookingError, '限流'):
-            client.book_slot(100, 100, [{'id': x, 'number': str(x)} for x in range(5)])
+            client.book_slot(100, 100, [{'id': x, 'number': str(x)} for x in range(1, 6)])
         self.assertEqual(client.request.call_count, 1)
 
     def test_taken_seat_switches_and_success_is_verified(self):
@@ -106,15 +112,17 @@ except main.AlreadyRunning:
         client.verify = Mock(return_value={'booking_id': '9'})
         with patch('main.time.sleep'):
             self.assertEqual(client.book_slot(100, 200, [{'id': 1, 'number': '1'},
-                             {'id': 2, 'number': '2'}]), {'booking_id': '9', 'submission_confirmed': True})
+                             {'id': 2, 'number': '2'}]), {'booking_id': '9', 'submission_confirmed': True,
+                                                       'outcome': 'confirmed_new'})
         client.verify.assert_called_once_with('9', 100, 200, 2)
 
     def test_timeout_queries_before_any_second_post(self):
         client = self.client()
         client.request = Mock(side_effect=requests.Timeout())
         client.bookings = Mock(return_value=[{'id': 9, 'time': 100, 'duration': 200, 'status': '0'}])
-        client.verify = Mock(return_value={'booking_id': '9'})
-        self.assertEqual(client.book_slot(100, 200, [{'id': 1}]), {'booking_id': '9'})
+        client.verify = Mock(return_value={'booking_id': '9', 'seat_id': 1,
+            'begin': datetime.fromtimestamp(100, main.SHANGHAI).isoformat(), 'duration': 200})
+        self.assertEqual(client.book_slot(100, 200, [{'id': 1}])['outcome'], 'recovered')
         self.assertEqual(client.request.call_count, 1)
 
     def test_native_acceptance_rejects_manual_duplicate_and_uncertain_orders(self):
