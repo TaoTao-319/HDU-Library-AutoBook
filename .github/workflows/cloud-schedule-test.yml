@@ -3,7 +3,7 @@ name: Cloud native schedule booking test
 on:
   schedule:
     # Temporary polling for one native event; the first run disables this workflow.
-    - cron: '*/5 * * * *'
+    - cron: '2-57/5 * * * *'
 
 permissions:
   contents: read
