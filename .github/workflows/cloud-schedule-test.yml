@@ -40,6 +40,7 @@ jobs:
         env:
           SCHOOL_ID: ${{ secrets.SCHOOL_ID }}
           PASSWORD: ${{ secrets.PASSWORD }}
+          HDU_CANCEL_TEST_ORDER: '22948633'
         run: python main.py --test-booking --date 2026-10-22 --start 7 --hours 1 --region 自定义
       - name: Accept only a new order from this native schedule run
         run: python scripts/verify_native_booking.py --date 2026-10-22 --start 7 --hours 1

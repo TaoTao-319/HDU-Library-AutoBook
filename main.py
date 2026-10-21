@@ -779,6 +779,9 @@ def run(args):
             return run_daily(client, args, day, slots, target_date, seat_config, user_config)
         login_for_target(client, target_time,
                          load_categories=target_time is None or args.check or isinstance(custom, dict))
+        if args.test_booking and os.environ.get('HDU_CANCEL_TEST_ORDER'):
+            from scripts.cancel_authorized_native_test_order import cancel_authorized
+            cancel_authorized(client, now())
         targets = [target_time]
         backup = getattr(args, 'backup_at', None)
         if isinstance(backup, str):
