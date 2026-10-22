@@ -181,7 +181,7 @@ class SubmissionSafetyTests(unittest.TestCase):
         self.client.request = Mock(side_effect=[
             {'ui_type': 'ht.Seat.OrderListPage', 'content': {'ui_type': 'com.List',
              'defaultItems': [], 'defaultNextUrl': '/next'}},
-            {'ui_type': 'com.List', 'defaultItems': [], 'defaultNextUrl': None}])
+            {'ui_type': 'com.ListData', 'items': [], 'nextUrl': None}])
         self.assertEqual(self.client.bookings(), [])
         self.assertEqual(self.client.request.call_count, 2)
 

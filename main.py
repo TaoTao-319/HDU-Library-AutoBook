@@ -341,14 +341,16 @@ class SeatAutoBooker:
             seen.add(path)
             payload = self.request('GET', path)
             container = payload.get('content') if payload.get('ui_type') == 'ht.Seat.OrderListPage' else payload
+            paged = isinstance(container, dict) and container.get('ui_type') == 'com.ListData'
+            items_key, next_key = ('items', 'nextUrl') if paged else ('defaultItems', 'defaultNextUrl')
             if (payload.get('CODE') not in (None, 'ok')
-                    or not isinstance(container, dict) or container.get('ui_type') != 'com.List'
-                    or not isinstance(container.get('defaultItems'), list)):
+                    or not isinstance(container, dict) or container.get('ui_type') not in ('com.List', 'com.ListData')
+                    or not isinstance(container.get(items_key), list)):
                 raise BookingError('预约列表响应无效，不能据此判断未预约')
             for item in walk(payload):
                 if item.get('ui_type') == 'ht.Seat.OrderListItem':
                     items.append(item)
-            path = container.get('defaultNextUrl')
+            path = container.get(next_key)
             if not path:
                 return items
         raise BookingError('预约记录超过分页上限，无法可靠确认重复预约')
@@ -501,6 +503,8 @@ class SeatAutoBooker:
             LOG.info('只读恢复确认了覆盖订单 %s；不计为本轮新建订单', result['booking_id'])
             return result
         except (BookingError, requests.RequestException, ValueError, KeyError, OSError, TypeError) as error:
+            LOG.warning('待确认查单失败：%s%s', type(error).__name__,
+                        '；' + str(error) if isinstance(error, BookingError) else '')
             raise SubmissionUncertain('待确认预约无法完成核验，停止新增提交；' + type(error).__name__) from None
 
     def reconcile_submission(self):
