@@ -111,6 +111,11 @@ class SeatPlanTests(unittest.TestCase):
         self.assertEqual((result, calls), (1, 5))
         client.login.assert_called_once()
 
+    def test_uncertain_submission_does_not_abort_later_rounds(self):
+        result, calls, client = self.simulate([main.SubmissionUncertain('查单超时')] * 4 + [0])
+        self.assertEqual((result, calls), (0, 5))
+        client.login.assert_called_once()
+
     def test_success_and_full_floor_end_remaining_rounds(self):
         for outcome in (0, main.NoSeats('四楼无座')):
             result, calls, client = self.simulate([outcome], repeat=True)

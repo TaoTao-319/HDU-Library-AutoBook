@@ -118,6 +118,7 @@ except main.AlreadyRunning:
 
     def test_timeout_queries_before_any_second_post(self):
         client = self.client()
+        client.get_user_info = Mock()
         client.request = Mock(side_effect=requests.Timeout())
         client.bookings = Mock(return_value=[{'id': 9, 'time': 100, 'duration': 200, 'status': '0'}])
         client.verify = Mock(return_value={'booking_id': '9', 'seat_id': 1,

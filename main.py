@@ -340,10 +340,15 @@ class SeatAutoBooker:
                 raise BookingError('预约记录分页循环')
             seen.add(path)
             payload = self.request('GET', path)
+            container = payload.get('content') if payload.get('ui_type') == 'ht.Seat.OrderListPage' else payload
+            if (payload.get('CODE') not in (None, 'ok')
+                    or not isinstance(container, dict) or container.get('ui_type') != 'com.List'
+                    or not isinstance(container.get('defaultItems'), list)):
+                raise BookingError('预约列表响应无效，不能据此判断未预约')
             for item in walk(payload):
                 if item.get('ui_type') == 'ht.Seat.OrderListItem':
                     items.append(item)
-            path = payload.get('content', {}).get('defaultNextUrl')
+            path = container.get('defaultNextUrl')
             if not path:
                 return items
         raise BookingError('预约记录超过分页上限，无法可靠确认重复预约')
@@ -465,10 +470,27 @@ class SeatAutoBooker:
                 result = self.verify(intent['booking_id'], intent['begin'],
                                      intent['duration'], intent['seat_id'])
             else:
-                existing = self.covered_booking(self.bookings(), intent['begin'], intent['duration'])
-                if not existing:
-                    raise SubmissionUncertain('预约提交结果仍未确认，停止新增预约；请在网页核对待确认记录')
-                result = self.verify(existing['id'], intent['begin'], intent['duration'], covers=True)
+                # Give a just-submitted order time to appear, then require two
+                # complete, authenticated list reads before permitting a retry.
+                remaining = 5 - (time.time() - intent['created_at'])
+                if remaining > 5:
+                    raise ValueError('待确认记录时间异常')
+                if remaining > 0:
+                    time.sleep(remaining)
+                for check in range(2):
+                    if check:
+                        time.sleep(2)
+                    self.get_user_info()
+                    if self.uid != intent['uid']:
+                        raise BookingError('查单账号发生变化')
+                    existing = self.covered_booking(self.bookings(), intent['begin'], intent['duration'])
+                    if existing:
+                        result = self.verify(existing['id'], intent['begin'], intent['duration'], covers=True)
+                        break
+                else:
+                    journal.clear(intent)
+                    LOG.warning('两次完整查单均无目标时段有效预约，已解除待确认状态，允许后续轮次重试')
+                    return None
             # A read-only recovery cannot prove this run created the order.
             result.update(submission_confirmed=False,
                           already_existed=str(result['booking_id']) in intent['baseline_ids'],
@@ -480,6 +502,12 @@ class SeatAutoBooker:
             return result
         except (BookingError, requests.RequestException, ValueError, KeyError, OSError, TypeError) as error:
             raise SubmissionUncertain('待确认预约无法完成核验，停止新增提交；' + type(error).__name__) from None
+
+    def reconcile_submission(self):
+        result = self.recover_pending()
+        if result is None:
+            raise BookingError('提交后查单确认尚未预约，等待下一轮补跑')
+        return result
 
     def cached_bookings(self):
         return SubmissionJournal(LOCAL, self.uid).verified_bookings()
@@ -513,10 +541,11 @@ class SeatAutoBooker:
             try:
                 payload = self.request('POST', BOOK_PATH, data=data, headers={'Api-Token': booking_token(data)})
             except (requests.RequestException, BookingError):
-                return self.recover_pending()
+                return self.reconcile_submission()
             result = payload.get('DATA', {})
             if not isinstance(result, dict):
-                raise SubmissionUncertain('预约响应结构异常，保留待确认记录，停止新增提交')
+                LOG.warning('预约响应结构异常，先查单核对提交结果')
+                return self.reconcile_submission()
             if payload.get('CODE') == 'ok' and result.get('result') == 'success' and result.get('bookingId'):
                 try:
                     journal.accepted(intent, result['bookingId'])
@@ -530,7 +559,7 @@ class SeatAutoBooker:
                 return verified
             message = str(result.get('msg') or payload.get('MESSAGE') or '预约失败')
             if any(key in message for key in ('已有预约', '重复预约', '已存在预约', '请先取消')):
-                return self.recover_pending()
+                return self.reconcile_submission()
             # Only recognised, explicit non-commit responses permit another POST.
             rejected = ('操作频繁', '请求太频繁', '超出可预约座位时间范围', '未开放', '未到预约',
                         '座位已被占用', '座位已被预约', '座位不可用', '座位不存在', '时长不合法', '参数错误')
@@ -540,7 +569,9 @@ class SeatAutoBooker:
                                                  '操作频繁，未开放', '座位已被占用'))
             if (result.get('result') == 'success' or result.get('bookingId')
                     or not explicit_rejection or not any(key in message for key in rejected)):
-                raise SubmissionUncertain('预约响应未能证明拒绝成交，保留待确认记录，停止新增提交')
+                LOG.warning('预约响应无法直接确认结果，先查单核对；CODE=%s result=%s message=%s',
+                            payload.get('CODE'), result.get('result'), message[:200])
+                return self.reconcile_submission()
             journal.clear(intent)
             if any(key in message for key in ('频繁', '人数过多', '稍后')):
                 raise BookingError('服务限流，等待下一轮补跑：' + message)
@@ -692,14 +723,17 @@ def run_daily(client, args, day, slots, target_date, seat_config, user_config):
     state = json.loads(state_path.read_text(encoding='utf-8')) if state_path.exists() else {'attempted': []}
     logged_in = False
     if client.has_pending():
-        login_for_target(client, None, load_categories=False)
-        logged_in = True
-        client.recover_pending()  # Even if all rounds or the day were recorded finished.
+        try:
+            login_for_target(client, None, load_categories=False)
+            logged_in = True
+            client.recover_pending()  # Even if all rounds or the day were recorded finished.
+        except (BookingError, requests.RequestException) as error:
+            LOG.warning('启动查单尚未完成，保留待确认记录，后续轮次继续核查：%s', error)
     def checkpoint():
         temporary = state_path.with_suffix('.tmp')
         temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
         os.replace(temporary, state_path)
-    if state.get('finished'):
+    if state.get('finished') and not client.has_pending():
         LOG.info('今日计划已结束：%s', state['finished'])
         return 0
     for index, target in enumerate(targets, 1):
@@ -727,8 +761,8 @@ def run_daily(client, args, day, slots, target_date, seat_config, user_config):
             state['finished'] = '预约已确认或已有覆盖订单'
             checkpoint()
             return result
-        except SubmissionUncertain:
-            raise
+        except SubmissionUncertain as error:
+            LOG.warning('第 %d/5 轮结果待确认，后续轮次先查单再决定是否重试：%s', index, error)
         except NoSeats as error:
             state['finished'] = '四楼无可用座位'
             checkpoint()

@@ -19,6 +19,9 @@ class SubmissionSafetyTests(unittest.TestCase):
         patcher = patch('main.LOCAL', self.local)
         patcher.start()
         self.addCleanup(patcher.stop)
+        sleeper = patch('main.time.sleep')
+        sleeper.start()
+        self.addCleanup(sleeper.stop)
         self.client = self.client_for_account()
         self.journal = SubmissionJournal(self.local, 123)
         self.data = {'api_time': 1, 'beginTime': 100, 'duration': 200,
@@ -28,6 +31,7 @@ class SubmissionSafetyTests(unittest.TestCase):
         client = main.SeatAutoBooker({'max-retry': 5})
         client.uid = 123
         client.allowed_seat_ids = {62581, 62582}
+        client.get_user_info = Mock()
         self.addCleanup(client.close)
         return client
 
@@ -39,15 +43,20 @@ class SubmissionSafetyTests(unittest.TestCase):
     def order_list(self):
         return [{'id': 9, 'time': 100, 'duration': 200, 'status': '0'}]
 
-    def test_empty_list_after_timeout_blocks_next_post_and_survives_restart(self):
+    def test_two_empty_reads_after_timeout_allow_next_round_to_submit(self):
         self.client.request = Mock(side_effect=requests.Timeout())
         self.client.bookings = Mock(return_value=[])
         for _ in range(2):
-            with self.assertRaises(main.SubmissionUncertain):
+            with self.assertRaisesRegex(main.BookingError, '尚未预约'):
                 self.client.book_slot(100, 200, [{'id': 62581}])
-        self.assertEqual(self.client.request.call_count, 1)
+        self.assertEqual(self.client.request.call_count, 2)
+        self.assertEqual(self.client.bookings.call_count, 4)
+        self.assertIsNone(self.journal.load())
+
+    def test_failed_lookup_preserves_pending_and_restart_only_checks_orders(self):
+        self.journal.start(self.data, [])
         restarted = self.client_for_account()
-        restarted.bookings = Mock(return_value=[])
+        restarted.bookings = Mock(side_effect=requests.Timeout())
         restarted.request = Mock()
         with self.assertRaises(main.SubmissionUncertain):
             restarted.book_slot(100, 200, [{'id': 62582}])
@@ -56,7 +65,7 @@ class SubmissionSafetyTests(unittest.TestCase):
 
     def test_post_non_json_or_redirect_error_remains_pending(self):
         self.client.request = Mock(side_effect=main.BookingError('API 未返回 JSON'))
-        self.client.bookings = Mock(return_value=[])
+        self.client.bookings = Mock(side_effect=requests.Timeout())
         with self.assertRaises(main.SubmissionUncertain):
             self.client.book_slot(100, 200, [{'id': 62581}])
         self.assertIsNotNone(self.journal.load())
@@ -123,6 +132,7 @@ class SubmissionSafetyTests(unittest.TestCase):
                 if self.journal.path.exists():
                     self.journal.path.unlink()
                 self.client.request = Mock(return_value=payload)
+                self.client.bookings = Mock(side_effect=requests.Timeout())
                 with self.assertRaises(main.SubmissionUncertain):
                     self.client.book_slot(100, 200, [{'id': 62581}])
                 self.assertIsNotNone(self.journal.load())
@@ -132,13 +142,48 @@ class SubmissionSafetyTests(unittest.TestCase):
         day = datetime(2026, 10, 21, 20, 16, tzinfo=main.SHANGHAI)
         (self.local / 'daily-state-2026-10-21.json').write_text(
             json.dumps({'attempted': [], 'finished': 'old completion'}))
-        self.client.bookings = Mock(return_value=[])
+        self.client.bookings = Mock(side_effect=requests.Timeout())
         self.client.login = Mock()
         config = {'自动预约': {'运行时间': ['20:00:00', '20:00:30', '20:01:30', '20:04:00', '20:10:00']}}
-        with patch('main.now', return_value=day), self.assertRaises(main.SubmissionUncertain):
-            main.run_daily(self.client, Mock(), {}, [], day.date(), {}, config)
+        with patch('main.now', return_value=day):
+            self.assertEqual(main.run_daily(self.client, Mock(), {}, [], day.date(), {}, config), 1)
         self.client.login.assert_called_once()
         self.client.bookings.assert_called_once()
+
+    def test_order_appearing_on_second_read_prevents_another_post(self):
+        self.journal.start(self.data, [])
+        self.client.bookings = Mock(side_effect=[[], self.order_list()])
+        self.client.request = Mock(return_value=self.detail())
+        result = self.client.book_slot(100, 200, [{'id': 62582}])
+        self.assertEqual(result['booking_id'], '9')
+        self.assertTrue(all(call.args[0] == 'GET' for call in self.client.request.call_args_list))
+        self.assertIsNone(self.journal.load())
+
+    def test_one_empty_read_followed_by_failure_does_not_allow_post(self):
+        self.journal.start(self.data, [])
+        self.client.bookings = Mock(side_effect=[[], requests.Timeout()])
+        self.client.request = Mock()
+        with self.assertRaises(main.SubmissionUncertain):
+            self.client.book_slot(100, 200, [{'id': 62582}])
+        self.client.request.assert_not_called()
+        self.assertIsNotNone(self.journal.load())
+
+    def test_invalid_order_list_is_not_treated_as_empty(self):
+        for payload in ({'CODE': 'error'}, {'ui_type': 'com.Message'},
+                        {'ui_type': 'ht.Seat.OrderListPage', 'content': {}},
+                        {'ui_type': 'com.List', 'defaultItems': None}):
+            with self.subTest(payload=payload):
+                self.client.request = Mock(return_value=payload)
+                with self.assertRaises(main.BookingError):
+                    self.client.bookings()
+
+    def test_valid_empty_paginated_list_is_checked_to_completion(self):
+        self.client.request = Mock(side_effect=[
+            {'ui_type': 'ht.Seat.OrderListPage', 'content': {'ui_type': 'com.List',
+             'defaultItems': [], 'defaultNextUrl': '/next'}},
+            {'ui_type': 'com.List', 'defaultItems': [], 'defaultNextUrl': None}])
+        self.assertEqual(self.client.bookings(), [])
+        self.assertEqual(self.client.request.call_count, 2)
 
     def test_normal_success_requires_exact_time_and_allowed_seat(self):
         self.client.request = Mock(side_effect=[
