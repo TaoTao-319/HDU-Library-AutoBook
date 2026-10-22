@@ -39,3 +39,9 @@ DeepSeek 仓库历史运行 [39594112569](https://github.com/TaoTao-319/HDU-Libr
 - 本轮结论为 **等待平台投递，真实验收尚未通过**。不能把配置完成、离线测试通过、历史手动订单或浏览器登录回退测试算作真实成功。
 
 实时结果以 [测试工作流运行列表](https://github.com/TaoTao-319/HDU-Library-AutoBook/actions/workflows/cloud-schedule-test.yml) 为准。
+
+## 后续实际结果：2026-10-22核对
+
+[运行39650008467](https://github.com/TaoTao-319/HDU-Library-AutoBook/actions/runs/39650008467) 已于北京时间2026-10-22 02:08:22创建，事件为 `schedule`，代码版本 `633c6dcea373f3df7e937ed674b211daaa3b1cfd`，并于02:10:30失败。工作流已禁用自身并成功领取单次执行权，但浏览器学校SSO登录等待超时，HTTP CAS回退随后也发生ReadTimeout。登录未完成，未执行指定测试订单取消与新单创建，验收步骤被跳过。
+
+因此，本次已经收到原生投递，但真实预约验收失败。过期的一次性测试保持禁用；每日生产任务和提前登录的最新核对见 [2026-10-22每日设置](DAILY-SETUP-2026-10-22.md)。

@@ -59,14 +59,16 @@ Windows 只保留一个启用的任务 `HDU-Library-Daily`，19:55 启动并提�
 
 | 预约日期 | 启用 | 开始 | 持续 |
 |---|---|---|---|
-| 周一 | true | 15:00 | 7小时 |
-| 周二 | true | 16:00 | 6小时 |
+| 周一 | true | 10:00 | 12小时 |
+| 周二 | true | 10:00 | 12小时 |
 | 周三 | true | 10:00 | 12小时 |
-| 周四 | true | 15:00 | 7小时 |
-| 周五 | true | 13:00 | 9小时 |
-| 周六、周日 | false | — | — |
+| 周四 | true | 10:00 | 12小时 |
+| 周五 | true | 10:00 | 12小时 |
+| 周六、周日 | true | 10:00 | 12小时 |
 
 以上按**预约日期**读取，例如周一晚读取周三配置。各天 `name` 都是 `自定义`。
+
+2026-10-22已核对本地及正式云端启用状态，并实际验证本机提前登录成功；云端登录和原生调度仍有失败、延迟记录，详见 [每日设置与登录核对](docs/DAILY-SETUP-2026-10-22.md)。
 
 ## 运行和验证
 
@@ -77,8 +79,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-Schedule.ps1
 # 启动当天的五轮计划；过期轮次会跳过
 .\.venv\Scripts\python.exe .\main.py --daily
 
-# 只读检查：四楼，默认后天，以下指定15:00起7小时，不提交预约
-.\.venv\Scripts\python.exe .\main.py --check --start 15 --hours 7
+# 只读检查：四楼，默认后天，10:00起12小时，不提交预约
+.\.venv\Scripts\python.exe .\main.py --check --start 10 --hours 12
 
 # 预约逻辑离线回归，不登录、不提交
 .\.venv\Scripts\python.exe -m unittest test_main test_seat_plan test_submission_safety test_native_schedule test_cas_auth
@@ -103,7 +105,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-Schedule.ps1
 
 ## 2026-10-21 状态与审查
 
-当前正式云端工作流同时保留手动入口和每天 UTC 11:50（北京时间19:50）的原生定时入口，定时模式执行 `main.py --daily`。云端 Secrets 使用 `SCHOOL_ID`、`PASSWORD`。本地与本仓库两个云端任务已按用户要求重新启用；临时测试任务运行一次后会再次自行禁用，且含固定日期守卫。启用状态可能随运行或后续操作变化，应以任务计划程序和 Actions 页面为准。
+当前正式云端工作流同时保留手动入口和每天 UTC 11:50（北京时间19:50）的原生定时入口，两种入口均执行 `main.py --daily`，提前启动时会等待20:00再提交。云端 Secrets 使用 `SCHOOL_ID`、`PASSWORD`。截至2026-10-22，本地日任务和正式云端工作流均已启用，过期的一次性测试工作流保持禁用。启用状态可能随后续操作变化，应以任务计划程序和 Actions 页面为准。
 
 [2026-10-21 16:00 的测试运行](https://github.com/TaoTao-319/HDU-Library-AutoBook/actions/runs/39566063473) 已确认由 `schedule` 触发，之后在学校 SSO 登录等待阶段失败。因此已有原生定时投递证据，尚不能据此认定原生定时预约成功。本地、不同 GitHub runner 和不同仓库之间没有共享本地锁，不能将各端“五轮上限”理解为全局五轮。
 
