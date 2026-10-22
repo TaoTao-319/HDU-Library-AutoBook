@@ -185,6 +185,31 @@ class SubmissionSafetyTests(unittest.TestCase):
         self.assertEqual(self.client.bookings(), [])
         self.assertEqual(self.client.request.call_count, 2)
 
+    def test_order_on_third_page_is_recovered_without_another_post(self):
+        self.journal.start(self.data, [])
+        self.client.request = Mock(side_effect=[
+            {'ui_type': 'ht.Seat.OrderListPage', 'content': {'ui_type': 'com.List',
+             'defaultItems': [], 'defaultNextUrl': '/page2'}},
+            {'ui_type': 'com.ListData', 'items': [], 'nextUrl': '/page3'},
+            {'ui_type': 'com.ListData', 'items': [dict(self.order_list()[0],
+             ui_type='ht.Seat.OrderListItem')], 'nextUrl': None}, self.detail()])
+        result = self.client.book_slot(100, 200, [{'id': 62582}])
+        self.assertEqual(result['booking_id'], '9')
+        self.assertEqual(self.client.request.call_count, 4)
+        self.assertTrue(all(call.args[0] == 'GET' for call in self.client.request.call_args_list))
+        self.assertIsNone(self.journal.load())
+
+    def test_error_on_later_page_keeps_pending_without_another_post(self):
+        self.journal.start(self.data, [])
+        self.client.request = Mock(side_effect=[
+            {'ui_type': 'ht.Seat.OrderListPage', 'content': {'ui_type': 'com.List',
+             'defaultItems': [], 'defaultNextUrl': '/page2'}},
+            {'CODE': 'error', 'MESSAGE': '服务异常'}])
+        with self.assertRaises(main.SubmissionUncertain):
+            self.client.book_slot(100, 200, [{'id': 62582}])
+        self.assertIsNotNone(self.journal.load())
+        self.assertTrue(all(call.args[0] == 'GET' for call in self.client.request.call_args_list))
+
     def test_normal_success_requires_exact_time_and_allowed_seat(self):
         self.client.request = Mock(side_effect=[
             {'CODE': 'ok', 'DATA': {'result': 'success', 'bookingId': '9'}},
